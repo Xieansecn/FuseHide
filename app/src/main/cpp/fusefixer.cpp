@@ -14,6 +14,8 @@ extern "C" {
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <chrono>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +29,9 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -54,11 +59,43 @@ struct fuse_entry_param {
 
 struct fuse_entry_out;
 struct fuse_entry_bpf_out;
+struct fuse_dirent {
+    uint64_t ino;
+    uint64_t off;
+    uint32_t namelen;
+    uint32_t type;
+    char name[];
+};
+struct fuse_read_out {
+    uint64_t offset;
+    uint32_t size;
+    uint32_t padding;
+};
+
+namespace mediaprovider {
+namespace fuse {
+
+struct DirectoryEntry {
+    DirectoryEntry(const std::string& name, int type) : d_name(name), d_type(type) {
+    }
+    const std::string d_name;
+    const int d_type;
+};
+
+}  // namespace fuse
+}  // namespace mediaprovider
 
 namespace {
 
 constexpr const char* kLogTag = "FuseFixer";
 constexpr const char* kTargetLibrary = "libfuse_jni.so";
+constexpr std::string_view kVisibleStorageRoots[] = {"/storage/emulated/0"};
+constexpr std::string_view kHiddenRootEntryNames[] = {"xinhao"};
+constexpr std::string_view kHiddenPackages[] = {
+    "com.eltavine.duckdetector",
+    "io.github.xiaotong6666.fusefixer",
+    "io.github.a13e300.fusefixer",
+};
 
 #if defined(NDEBUG)
 constexpr bool kEnableDebugHooks = false;
@@ -72,6 +109,13 @@ extern "C" int8_t u_hasBinaryProperty(uint32_t codePoint, int32_t which);
 UHasBinaryPropertyFn gUHasBinaryProperty = u_hasBinaryProperty;
 
 constexpr int32_t kUCHAR_DEFAULT_IGNORABLE_CODE_POINT = 5;
+
+bool IsTestHiddenUid(uint32_t uid);
+bool IsAnyHiddenSubtreePath(std::string_view path);
+bool IsHiddenRootEntryName(std::string_view name);
+bool ShouldHideTestPath(uint32_t uid, std::string_view path);
+bool IsTrackedHiddenSubtreeInode(uint64_t ino);
+bool RemoveTrackedHiddenSubtreeInode(uint64_t ino);
 
 // Hook symbol names
 
@@ -111,6 +155,22 @@ using HookInstaller = int (*)(void* target, void* replacement, void** backup);
 using IsAppAccessiblePathFn = bool (*)(void* fuse, const std::string& path, uint32_t uid);
 using IsPackageOwnedPathFn = bool (*)(const std::string& lhs, const std::string& rhs);
 using IsBpfBackingPathFn = bool (*)(const std::string& path);
+using ShouldNotCacheFn = bool (*)(void* fuse, const std::string& path);
+using DirectoryEntries = std::vector<std::shared_ptr<mediaprovider::fuse::DirectoryEntry>>;
+using GetDirectoryEntriesFn = DirectoryEntries (*)(void* wrapper, uint32_t uid,
+                                                   const std::string& path, DIR* dirp);
+
+constexpr uintptr_t kDeviceShouldNotCacheOffset = 0x0017dc64;
+constexpr uintptr_t kDeviceGetDirectoryEntriesOffset = 0x0018a3ec;
+constexpr uintptr_t kDevicePfMkdirOffset = 0x00177050;
+constexpr uintptr_t kDevicePfMknodOffset = 0x00176ba8;
+constexpr uintptr_t kDevicePfUnlinkOffset = 0x00177534;
+constexpr uintptr_t kDevicePfRmdirOffset = 0x00177920;
+constexpr uintptr_t kDevicePfCreateOffset = 0x0017a7c8;
+constexpr uintptr_t kDevicePfReaddirOffset = 0x00179c40;
+constexpr uintptr_t kDevicePfReaddirPostfilterOffset = 0x00179cac;
+constexpr uintptr_t kDevicePfReaddirplusOffset = 0x0017b320;
+constexpr size_t kFuseEntryOutWireSize = 128;
 
 #if defined(__LP64__)
 using ElfHeader = Elf64_Ehdr;
@@ -274,6 +334,7 @@ void FlushCodeRange(void* begin, void* end) {
 }
 
 HookInstaller gHookInstaller = nullptr;
+JavaVM* gJavaVm = nullptr;
 IsAppAccessiblePathFn gOriginalIsAppAccessiblePath = nullptr;
 IsPackageOwnedPathFn gOriginalIsPackageOwnedPath = nullptr;
 IsBpfBackingPathFn gOriginalIsBpfBackingPath = nullptr;
@@ -286,11 +347,157 @@ std::atomic<int> gBpfBackingLogCount{0};
 std::atomic<int> gStrcasecmpLogCount{0};
 std::atomic<int> gEqualsIgnoreCaseLogCount{0};
 std::atomic<int> gSuspiciousDirectLogCount{0};
+std::mutex gUidHideCacheMutex;
+std::unordered_map<uint32_t, bool> gUidHideCache;
 std::string EscapeForLog(const uint8_t* data, size_t length);
 
 bool ShouldLogLimited(std::atomic<int>& counter, int limit = 8) {
     const int old = counter.fetch_add(1, std::memory_order_relaxed);
     return old < limit;
+}
+
+template <typename... Args>
+inline void DebugLogPrint(int priority, const char* fmt, Args... args) {
+    if constexpr (kEnableDebugHooks) {
+        __android_log_print(priority, kLogTag, fmt, args...);
+    }
+}
+
+bool IsHiddenPackageName(std::string_view packageName) {
+    for (const auto& hiddenPackage : kHiddenPackages) {
+        if (packageName == hiddenPackage) {
+            return true;
+        }
+    }
+    return false;
+}
+
+JNIEnv* GetJniEnv(bool* didAttach) {
+    if (didAttach != nullptr) {
+        *didAttach = false;
+    }
+    if (gJavaVm == nullptr) {
+        return nullptr;
+    }
+    JNIEnv* env = nullptr;
+    const jint status = gJavaVm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (status == JNI_OK) {
+        return env;
+    }
+    if (status != JNI_EDETACHED) {
+        return nullptr;
+    }
+    if (gJavaVm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+        return nullptr;
+    }
+    if (didAttach != nullptr) {
+        *didAttach = true;
+    }
+    return env;
+}
+
+std::optional<bool> ResolveShouldHideUidWithPackageManager(uint32_t uid) {
+    bool didAttach = false;
+    JNIEnv* env = GetJniEnv(&didAttach);
+    if (env == nullptr) {
+        return std::nullopt;
+    }
+
+    auto finish = [&](std::optional<bool> value) {
+        if (didAttach) {
+            gJavaVm->DetachCurrentThread();
+        }
+        return value;
+    };
+
+    jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
+    if (activityThreadClass == nullptr || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return finish(std::nullopt);
+    }
+    jmethodID currentApplication = env->GetStaticMethodID(activityThreadClass, "currentApplication",
+                                                          "()Landroid/app/Application;");
+    if (currentApplication == nullptr || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(activityThreadClass);
+        return finish(std::nullopt);
+    }
+    jobject application = env->CallStaticObjectMethod(activityThreadClass, currentApplication);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(activityThreadClass);
+        return finish(std::nullopt);
+    }
+    env->DeleteLocalRef(activityThreadClass);
+    if (application == nullptr) {
+        return finish(std::nullopt);
+    }
+
+    jclass applicationClass = env->GetObjectClass(application);
+    jmethodID getPackageManager = env->GetMethodID(applicationClass, "getPackageManager",
+                                                   "()Landroid/content/pm/PackageManager;");
+    if (getPackageManager == nullptr || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(applicationClass);
+        env->DeleteLocalRef(application);
+        return finish(std::nullopt);
+    }
+    jobject packageManager = env->CallObjectMethod(application, getPackageManager);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(applicationClass);
+        env->DeleteLocalRef(application);
+        return finish(std::nullopt);
+    }
+    env->DeleteLocalRef(applicationClass);
+    env->DeleteLocalRef(application);
+    if (packageManager == nullptr) {
+        return finish(std::nullopt);
+    }
+
+    jclass packageManagerClass = env->FindClass("android/content/pm/PackageManager");
+    jmethodID getPackagesForUid =
+        env->GetMethodID(packageManagerClass, "getPackagesForUid", "(I)[Ljava/lang/String;");
+    if (getPackagesForUid == nullptr || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(packageManagerClass);
+        env->DeleteLocalRef(packageManager);
+        return finish(std::nullopt);
+    }
+
+    jobjectArray packages = static_cast<jobjectArray>(
+        env->CallObjectMethod(packageManager, getPackagesForUid, (jint)uid));
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(packageManagerClass);
+        env->DeleteLocalRef(packageManager);
+        return finish(std::nullopt);
+    }
+    env->DeleteLocalRef(packageManagerClass);
+    env->DeleteLocalRef(packageManager);
+
+    bool shouldHide = false;
+    if (packages != nullptr) {
+        const jsize count = env->GetArrayLength(packages);
+        for (jsize i = 0; i < count; ++i) {
+            jstring packageName = static_cast<jstring>(env->GetObjectArrayElement(packages, i));
+            if (packageName == nullptr) {
+                continue;
+            }
+            const char* packageNameChars = env->GetStringUTFChars(packageName, nullptr);
+            if (packageNameChars != nullptr) {
+                shouldHide = IsHiddenPackageName(packageNameChars);
+                env->ReleaseStringUTFChars(packageName, packageNameChars);
+            }
+            env->DeleteLocalRef(packageName);
+            if (shouldHide) {
+                break;
+            }
+        }
+        env->DeleteLocalRef(packages);
+    }
+    DebugLogPrint(4, "resolved uid=%u hide=%d", static_cast<unsigned>(uid), shouldHide ? 1 : 0);
+    return finish(shouldHide);
 }
 
 std::string DebugPreview(std::string_view value, size_t limit = 96) {
@@ -760,12 +967,109 @@ final_compare:
 // Debug hooks for FUSE daemon
 void* gOriginalPfLookup = nullptr;
 void* gOriginalPfLookupPostfilter = nullptr;
+void* gOriginalPfAccess = nullptr;
+void* gOriginalPfOpen = nullptr;
+void* gOriginalPfOpendir = nullptr;
+void* gOriginalPfMknod = nullptr;
+void* gOriginalPfMkdir = nullptr;
+void* gOriginalPfUnlink = nullptr;
+void* gOriginalPfRmdir = nullptr;
+void* gOriginalPfCreate = nullptr;
+void* gOriginalPfReaddir = nullptr;
+void* gOriginalPfReaddirPostfilter = nullptr;
+void* gOriginalPfReaddirplus = nullptr;
+void* gOriginalPfGetattr = nullptr;
+void* gOriginalOpen = nullptr;
+void* gOriginalOpen2 = nullptr;
+void* gOriginalMkdir = nullptr;
+void* gOriginalMknod = nullptr;
+void* gOriginalLstat = nullptr;
+void* gOriginalStat = nullptr;
+void* gOriginalShouldNotCache = nullptr;
 void* gOriginalNotifyInvalEntry = nullptr;
 void* gOriginalNotifyInvalInode = nullptr;
+void* gOriginalReplyAttr = nullptr;
 void* gOriginalReplyEntry = nullptr;
 void* gOriginalReplyBuf = nullptr;
 void* gOriginalReplyErr = nullptr;
+void* gOriginalGetDirectoryEntries = nullptr;
+std::atomic<void*> gLastFuseSession{nullptr};
+std::atomic<bool> gHiddenEntryInvalidationPending{false};
+std::atomic<uint64_t> gHiddenRootParentInode{0};
+thread_local bool gInPfLookup = false;
 thread_local bool gInPfLookupPostfilter = false;
+thread_local bool gInPfReaddir = false;
+thread_local bool gInPfReaddirPostfilter = false;
+thread_local bool gInPfReaddirplus = false;
+thread_local bool gInPfGetattr = false;
+thread_local uint32_t gPfGetattrUid = 0;
+thread_local uint32_t gPfReaddirUid = 0;
+thread_local uint64_t gPfGetattrIno = 0;
+thread_local uint64_t gPfReaddirIno = 0;
+thread_local uint64_t gCurrentLookupParentInode = 0;
+thread_local bool gTrackRootHiddenLookup = false;
+thread_local bool gTrackHiddenSubtreeLookup = false;
+thread_local bool gZeroAttrCacheForCurrentGetattr = false;
+std::mutex gHiddenSubtreeInodesMutex;
+std::unordered_set<uint64_t> gHiddenSubtreeInodes;
+
+uint32_t ReqUid(fuse_req_t req) {
+    if (req == nullptr) {
+        return 0;
+    }
+    // The analyzed device build reads the caller uid from fuse_req + 0x3c in pf_getattr()
+    // and related handlers. This test-only helper mirrors that layout.
+    return *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(req) + 0x3c);
+}
+
+void RememberFuseSession(fuse_req_t req) {
+    if (req != nullptr && req->se != nullptr) {
+        gLastFuseSession.store(req->se, std::memory_order_relaxed);
+    }
+}
+
+void ScheduleHiddenEntryInvalidation() {
+    auto notifyEntry =
+        reinterpret_cast<int (*)(void*, uint64_t, const char*, size_t)>(gOriginalNotifyInvalEntry);
+    void* session = gLastFuseSession.load(std::memory_order_relaxed);
+    if (notifyEntry == nullptr || session == nullptr) {
+        return;
+    }
+    if (gHiddenEntryInvalidationPending.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    const uint64_t parent = gHiddenRootParentInode.load(std::memory_order_relaxed);
+    if (parent == 0) {
+        gHiddenEntryInvalidationPending.store(false, std::memory_order_release);
+        return;
+    }
+    std::thread([notifyEntry, session]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const uint64_t rootParent = gHiddenRootParentInode.load(std::memory_order_relaxed);
+        for (const auto& rootEntryName : kHiddenRootEntryNames) {
+            const int ret =
+                notifyEntry(session, rootParent, rootEntryName.data(), rootEntryName.size());
+            DebugLogPrint(4, "scheduled hidden entry invalidation parent=0x%lx name=%s ret=%d",
+                          (unsigned long)rootParent, DebugPreview(rootEntryName).c_str(), ret);
+        }
+        gHiddenEntryInvalidationPending.store(false, std::memory_order_release);
+    }).detach();
+}
+
+void ScheduleHiddenInodeInvalidation(uint64_t ino) {
+    auto notifyInode =
+        reinterpret_cast<int (*)(void*, uint64_t, off_t, off_t)>(gOriginalNotifyInvalInode);
+    void* session = gLastFuseSession.load(std::memory_order_relaxed);
+    if (notifyInode == nullptr || session == nullptr || ino == 0) {
+        return;
+    }
+    std::thread([notifyInode, session, ino]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const int ret = notifyInode(session, ino, 0, 0);
+        DebugLogPrint(4, "scheduled hidden inode invalidation ino=0x%lx ret=%d", (unsigned long)ino,
+                      ret);
+    }).detach();
+}
 
 std::string InodePath(uint64_t ino) {
     if (ino == 1)
@@ -779,20 +1083,368 @@ std::string InodePath(uint64_t ino) {
     return std::string(buf);
 }
 
+bool IsHiddenLookupTarget(uint32_t uid, uint64_t parent, uint32_t error_in, const char* name) {
+    if (!IsTestHiddenUid(uid) || error_in != 0 || name == nullptr || !IsHiddenRootEntryName(name)) {
+        return false;
+    }
+    const uint64_t rootParent = gHiddenRootParentInode.load(std::memory_order_relaxed);
+    return rootParent == 0 || parent == rootParent;
+}
+
+enum class HiddenNamedTargetKind {
+    None,
+    Root,
+    Descendant,
+};
+
+HiddenNamedTargetKind ClassifyHiddenNamedTarget(uint32_t uid, uint64_t parent, const char* name) {
+    if (!IsTestHiddenUid(uid) || name == nullptr) {
+        return HiddenNamedTargetKind::None;
+    }
+    const uint64_t rootParent = gHiddenRootParentInode.load(std::memory_order_relaxed);
+    if (parent != 0 && parent != rootParent && IsTrackedHiddenSubtreeInode(parent)) {
+        return HiddenNamedTargetKind::Descendant;
+    }
+    if (!IsHiddenRootEntryName(name)) {
+        return HiddenNamedTargetKind::None;
+    }
+    if (rootParent == 0 || parent == rootParent) {
+        return HiddenNamedTargetKind::Root;
+    }
+    return HiddenNamedTargetKind::None;
+}
+
+bool ReplyHiddenNamedTargetError(fuse_req_t req, const char* opName, HiddenNamedTargetKind kind,
+                                 int rootErr, int descendantErr) {
+    if (kind == HiddenNamedTargetKind::None) {
+        return false;
+    }
+    const int err = kind == HiddenNamedTargetKind::Root ? rootErr : descendantErr;
+    DebugLogPrint(4, "%s hide named target err=%d root=%d", opName, err,
+                  kind == HiddenNamedTargetKind::Root ? 1 : 0);
+    auto replyErr = reinterpret_cast<int (*)(fuse_req_t, int)>(gOriginalReplyErr);
+    if (replyErr != nullptr) {
+        replyErr(req, err);
+    }
+    return true;
+}
+
+extern "C" bool WrappedShouldNotCache(void* fuse, const std::string& path) {
+    if (IsAnyHiddenSubtreePath(path)) {
+        DebugLogPrint(4, "force uncached subtree path=%s", DebugPreview(path).c_str());
+        return true;
+    }
+    auto fn = reinterpret_cast<ShouldNotCacheFn>(gOriginalShouldNotCache);
+    return fn ? fn(fuse, path) : false;
+}
+
+bool IsTrackedHiddenSubtreeInode(uint64_t ino) {
+    std::lock_guard<std::mutex> lock(gHiddenSubtreeInodesMutex);
+    return gHiddenSubtreeInodes.find(ino) != gHiddenSubtreeInodes.end();
+}
+
+bool TrackHiddenSubtreeInode(uint64_t ino) {
+    if (ino == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(gHiddenSubtreeInodesMutex);
+    return gHiddenSubtreeInodes.insert(ino).second;
+}
+
+bool RemoveTrackedHiddenSubtreeInode(uint64_t ino) {
+    if (ino == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(gHiddenSubtreeInodesMutex);
+    return gHiddenSubtreeInodes.erase(ino) != 0;
+}
+
+bool IsHiddenRootEntryName(std::string_view name) {
+    for (const auto& rootEntryName : kHiddenRootEntryNames) {
+        if (name == rootEntryName) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsAnyHiddenSubtreePath(std::string_view path) {
+    for (const auto& root : kVisibleStorageRoots) {
+        for (const auto& rootEntryName : kHiddenRootEntryNames) {
+            const size_t prefixLen = root.size() + 1 + rootEntryName.size();
+            if (path.size() < prefixLen || path.compare(0, root.size(), root) != 0 ||
+                path[root.size()] != '/' ||
+                path.compare(root.size() + 1, rootEntryName.size(), rootEntryName) != 0) {
+                continue;
+            }
+            if (path.size() == prefixLen || path[prefixLen] == '/') {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool IsExactHiddenTargetPath(std::string_view path) {
+    for (const auto& root : kVisibleStorageRoots) {
+        for (const auto& rootEntryName : kHiddenRootEntryNames) {
+            const size_t prefixLen = root.size() + 1 + rootEntryName.size();
+            if (path.size() != prefixLen || path.compare(0, root.size(), root) != 0 ||
+                path[root.size()] != '/' ||
+                path.compare(root.size() + 1, rootEntryName.size(), rootEntryName) != 0) {
+                continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsHiddenRootDirectoryPath(std::string_view path) {
+    for (const auto& root : kVisibleStorageRoots) {
+        if (path == root) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string JoinPathComponent(std::string_view parent, std::string_view child) {
+    std::string joined(parent);
+    if (joined.empty() || joined.back() != '/') {
+        joined.push_back('/');
+    }
+    joined.append(child.data(), child.size());
+    return joined;
+}
+
+size_t AlignDirentName(size_t nameLen) {
+    return (nameLen + sizeof(uint64_t) - 1) & ~(sizeof(uint64_t) - 1);
+}
+
+size_t FuseDirentRecordSize(const fuse_dirent* dirent) {
+    return offsetof(fuse_dirent, name) + AlignDirentName(dirent->namelen);
+}
+
+size_t FuseDirentplusRecordSize(const fuse_dirent* dirent) {
+    return kFuseEntryOutWireSize + offsetof(fuse_dirent, name) + AlignDirentName(dirent->namelen);
+}
+
+bool ShouldFilterHiddenRootDirent(uint32_t uid, uint64_t ino, std::string_view name,
+                                  bool requireParentMatch) {
+    if (!IsTestHiddenUid(uid) || !IsHiddenRootEntryName(name)) {
+        return false;
+    }
+    if (!requireParentMatch) {
+        return true;
+    }
+    const uint64_t rootParent = gHiddenRootParentInode.load(std::memory_order_relaxed);
+    return rootParent == 0 || ino == rootParent;
+}
+
+bool BuildFilteredDirentPayload(const char* data, size_t size, uint32_t uid, uint64_t ino,
+                                std::vector<char>* out, size_t* removedCount,
+                                bool requireParentMatch = true) {
+    if (data == nullptr || size == 0 || out == nullptr || removedCount == nullptr) {
+        return false;
+    }
+
+    out->clear();
+    out->reserve(size);
+    size_t offset = 0;
+    size_t removed = 0;
+    while (offset + offsetof(fuse_dirent, name) <= size) {
+        const auto* dirent = reinterpret_cast<const fuse_dirent*>(data + offset);
+        const size_t recordSize = FuseDirentRecordSize(dirent);
+        if (recordSize == 0 || offset + recordSize > size) {
+            return false;
+        }
+        const std::string_view name(dirent->name, dirent->namelen);
+        if (ShouldFilterHiddenRootDirent(uid, ino, name, requireParentMatch)) {
+            removed++;
+        } else {
+            out->insert(out->end(), data + offset, data + offset + recordSize);
+        }
+        offset += recordSize;
+    }
+    if (offset != size) {
+        return false;
+    }
+    *removedCount = removed;
+    return removed != 0;
+}
+
+bool BuildFilteredDirentplusPayload(const char* data, size_t size, uint32_t uid, uint64_t ino,
+                                    std::vector<char>* out, size_t* removedCount,
+                                    bool requireParentMatch = true) {
+    if (data == nullptr || size == 0 || out == nullptr || removedCount == nullptr) {
+        return false;
+    }
+
+    out->clear();
+    out->reserve(size);
+    size_t offset = 0;
+    size_t removed = 0;
+    while (offset + kFuseEntryOutWireSize + offsetof(fuse_dirent, name) <= size) {
+        const auto* dirent =
+            reinterpret_cast<const fuse_dirent*>(data + offset + kFuseEntryOutWireSize);
+        const size_t recordSize = FuseDirentplusRecordSize(dirent);
+        if (recordSize == 0 || offset + recordSize > size) {
+            return false;
+        }
+        const std::string_view name(dirent->name, dirent->namelen);
+        if (ShouldFilterHiddenRootDirent(uid, ino, name, requireParentMatch)) {
+            removed++;
+        } else {
+            out->insert(out->end(), data + offset, data + offset + recordSize);
+        }
+        offset += recordSize;
+    }
+    if (offset != size) {
+        return false;
+    }
+    *removedCount = removed;
+    return removed != 0;
+}
+
+void NoteHiddenSubtreePathForCache(std::string_view path) {
+    if (!IsAnyHiddenSubtreePath(path)) {
+        return;
+    }
+
+    // AOSP get_entry_timeout()/pf_getattr cache decisions are path-based rather than uid-based.
+    // Once this subtree is observed anywhere in the daemon, proactively invalidate the root dentry
+    // so a positive lookup seeded by another uid does not stay shared in kernel/VFS cache.
+    ScheduleHiddenEntryInvalidation();
+
+    if (gInPfLookup && gCurrentLookupParentInode != 0) {
+        const uint64_t rootParent = gHiddenRootParentInode.load(std::memory_order_relaxed);
+        if (IsExactHiddenTargetPath(path) && gCurrentLookupParentInode == rootParent) {
+            RemoveTrackedHiddenSubtreeInode(gCurrentLookupParentInode);
+            return;
+        }
+        gTrackHiddenSubtreeLookup = true;
+        if (TrackHiddenSubtreeInode(gCurrentLookupParentInode)) {
+            DebugLogPrint(4, "track hidden lookup parent=%s path=%s",
+                          InodePath(gCurrentLookupParentInode).c_str(), DebugPreview(path).c_str());
+            ScheduleHiddenInodeInvalidation(gCurrentLookupParentInode);
+        }
+    }
+
+    if (gInPfGetattr && gPfGetattrIno != 0) {
+        gZeroAttrCacheForCurrentGetattr = true;
+        if (TrackHiddenSubtreeInode(gPfGetattrIno)) {
+            DebugLogPrint(4, "track hidden getattr ino=%s path=%s",
+                          InodePath(gPfGetattrIno).c_str(), DebugPreview(path).c_str());
+            ScheduleHiddenInodeInvalidation(gPfGetattrIno);
+        }
+    }
+}
+
 extern "C" void WrappedPfLookup(fuse_req_t req, uint64_t parent, const char* name) {
-    __android_log_print(3, kLogTag, "lookup: req=%lu parent=%s name=%s", (unsigned long)req->unique,
-                        InodePath(parent).c_str(), name ? DebugPreview(name).c_str() : "null");
+    RememberFuseSession(req);
+    if (name != nullptr && IsHiddenRootEntryName(name) && parent != 0) {
+        uint64_t expected = 0;
+        if (gHiddenRootParentInode.compare_exchange_strong(expected, parent,
+                                                           std::memory_order_relaxed)) {
+            DebugLogPrint(4, "record hidden root parent=%s", InodePath(parent).c_str());
+        }
+    }
+    const uint64_t rootParent = gHiddenRootParentInode.load(std::memory_order_relaxed);
+    gInPfLookup = true;
+    gCurrentLookupParentInode = parent;
+    gTrackRootHiddenLookup =
+        name != nullptr && IsHiddenRootEntryName(name) && (rootParent == 0 || parent == rootParent);
+    gTrackHiddenSubtreeLookup = IsTrackedHiddenSubtreeInode(parent);
+    DebugLogPrint(3, "lookup: req=%lu parent=%s name=%s", (unsigned long)req->unique,
+                  InodePath(parent).c_str(), name ? DebugPreview(name).c_str() : "null");
 
     auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, const char*)>(gOriginalPfLookup);
     if (fn)
         fn(req, parent, name);
+    gCurrentLookupParentInode = 0;
+    gInPfLookup = false;
+    gTrackHiddenSubtreeLookup = false;
+    gTrackRootHiddenLookup = false;
+}
+
+DirectoryEntries FilterHiddenDirectoryEntries(uint32_t uid, std::string_view parentPath,
+                                              DirectoryEntries entries) {
+    if (!IsTestHiddenUid(uid) || entries.empty()) {
+        return entries;
+    }
+
+    const size_t before = entries.size();
+    entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                 [&](const auto& entry) {
+                                     if (!entry) {
+                                         return false;
+                                     }
+                                     const std::string& name = entry->d_name;
+                                     if (name.empty() || name[0] == '/') {
+                                         return false;
+                                     }
+                                     return ShouldHideTestPath(uid,
+                                                               JoinPathComponent(parentPath, name));
+                                 }),
+                  entries.end());
+
+    if (entries.size() != before) {
+        DebugLogPrint(4, "filter dir entries uid=%u parent=%s removed=%zu remaining=%zu",
+                      static_cast<unsigned>(uid), DebugPreview(parentPath).c_str(),
+                      before - entries.size(), entries.size());
+    }
+    return entries;
+}
+
+DirectoryEntries WrappedGetDirectoryEntries(void* wrapper, uint32_t uid, const std::string& path,
+                                            DIR* dirp) {
+    auto fn = reinterpret_cast<GetDirectoryEntriesFn>(gOriginalGetDirectoryEntries);
+    DirectoryEntries entries = fn ? fn(wrapper, uid, path, dirp) : DirectoryEntries();
+    return FilterHiddenDirectoryEntries(uid, path, std::move(entries));
+}
+
+extern "C" void WrappedPfReaddirPostfilter(fuse_req_t req, uint64_t ino, uint32_t error_in,
+                                           off_t off_in, off_t off_out, size_t size_out,
+                                           const void* dirents_in, void* fi) {
+    RememberFuseSession(req);
+    const uint32_t uid = ReqUid(req);
+    auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, uint32_t, off_t, off_t, size_t,
+                                        const void*, void*)>(gOriginalPfReaddirPostfilter);
+    if (fn == nullptr) {
+        return;
+    }
+    DebugLogPrint(3, "pf_readdir_postfilter uid=%u ino=%s err=%u off_in=%lld off_out=%lld size=%zu",
+                  static_cast<unsigned>(uid), InodePath(ino).c_str(), error_in,
+                  static_cast<long long>(off_in), static_cast<long long>(off_out), size_out);
+
+    gInPfReaddirPostfilter = true;
+    gPfReaddirUid = uid;
+    gPfReaddirIno = ino;
+    fn(req, ino, error_in, off_in, off_out, size_out, dirents_in, fi);
+    gPfReaddirIno = 0;
+    gPfReaddirUid = 0;
+    gInPfReaddirPostfilter = false;
 }
 
 extern "C" void WrappedPfLookupPostfilter(fuse_req_t req, uint64_t parent, uint32_t error_in,
                                           const char* name, struct fuse_entry_out* feo,
                                           struct fuse_entry_bpf_out* febo) {
-    __android_log_print(3, kLogTag, "pf_lookup_postfilter req=%p parent=%s name=%s", req,
-                        InodePath(parent).c_str(), name ? DebugPreview(name).c_str() : "null");
+    RememberFuseSession(req);
+    const uint32_t uid = ReqUid(req);
+    DebugLogPrint(3, "pf_lookup_postfilter req=%p uid=%u parent=%s name=%s err_in=%u", req,
+                  static_cast<unsigned>(uid), InodePath(parent).c_str(),
+                  name ? DebugPreview(name).c_str() : "null", error_in);
+    if (IsHiddenLookupTarget(uid, parent, error_in, name)) {
+        DebugLogPrint(4, "pf_lookup_postfilter hide uid=%u parent=%s name=%s",
+                      static_cast<unsigned>(uid), InodePath(parent).c_str(), name);
+        ScheduleHiddenEntryInvalidation();
+        auto replyErr = reinterpret_cast<int (*)(fuse_req_t, int)>(gOriginalReplyErr);
+        if (replyErr != nullptr) {
+            replyErr(req, ENOENT);
+        }
+        return;
+    }
     auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, uint32_t, const char*,
                                         struct fuse_entry_out*, struct fuse_entry_bpf_out*)>(
         gOriginalPfLookupPostfilter);
@@ -803,14 +1455,141 @@ extern "C" void WrappedPfLookupPostfilter(fuse_req_t req, uint64_t parent, uint3
     }
 }
 
+extern "C" void WrappedPfAccess(fuse_req_t req, uint64_t ino, int mask) {
+    RememberFuseSession(req);
+    auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, int)>(gOriginalPfAccess);
+    if (fn) {
+        fn(req, ino, mask);
+    }
+}
+
+extern "C" void WrappedPfOpen(fuse_req_t req, uint64_t ino, void* fi) {
+    RememberFuseSession(req);
+    auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, void*)>(gOriginalPfOpen);
+    if (fn) {
+        fn(req, ino, fi);
+    }
+}
+
+extern "C" void WrappedPfOpendir(fuse_req_t req, uint64_t ino, void* fi) {
+    RememberFuseSession(req);
+    auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, void*)>(gOriginalPfOpendir);
+    if (fn) {
+        fn(req, ino, fi);
+    }
+}
+
+extern "C" void WrappedPfMkdir(fuse_req_t req, uint64_t parent, const char* name, uint32_t mode) {
+    RememberFuseSession(req);
+    const HiddenNamedTargetKind kind = ClassifyHiddenNamedTarget(ReqUid(req), parent, name);
+    if (ReplyHiddenNamedTargetError(req, "pf_mkdir", kind, EACCES, ENOENT)) {
+        return;
+    }
+    auto fn =
+        reinterpret_cast<void (*)(fuse_req_t, uint64_t, const char*, uint32_t)>(gOriginalPfMkdir);
+    if (fn) {
+        fn(req, parent, name, mode);
+    }
+}
+
+extern "C" void WrappedPfMknod(fuse_req_t req, uint64_t parent, const char* name, uint32_t mode,
+                               uint64_t rdev) {
+    RememberFuseSession(req);
+    const HiddenNamedTargetKind kind = ClassifyHiddenNamedTarget(ReqUid(req), parent, name);
+    if (ReplyHiddenNamedTargetError(req, "pf_mknod", kind, EPERM, ENOENT)) {
+        return;
+    }
+    auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, const char*, uint32_t, uint64_t)>(
+        gOriginalPfMknod);
+    if (fn) {
+        fn(req, parent, name, mode, rdev);
+    }
+}
+
+extern "C" void WrappedPfUnlink(fuse_req_t req, uint64_t parent, const char* name) {
+    RememberFuseSession(req);
+    const HiddenNamedTargetKind kind = ClassifyHiddenNamedTarget(ReqUid(req), parent, name);
+    if (ReplyHiddenNamedTargetError(req, "pf_unlink", kind, ENOENT, ENOENT)) {
+        return;
+    }
+    auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, const char*)>(gOriginalPfUnlink);
+    if (fn) {
+        fn(req, parent, name);
+    }
+}
+
+extern "C" void WrappedPfRmdir(fuse_req_t req, uint64_t parent, const char* name) {
+    RememberFuseSession(req);
+    const HiddenNamedTargetKind kind = ClassifyHiddenNamedTarget(ReqUid(req), parent, name);
+    if (ReplyHiddenNamedTargetError(req, "pf_rmdir", kind, ENOENT, ENOENT)) {
+        return;
+    }
+    auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, const char*)>(gOriginalPfRmdir);
+    if (fn) {
+        fn(req, parent, name);
+    }
+}
+
+extern "C" void WrappedPfCreate(fuse_req_t req, uint64_t parent, const char* name, uint32_t mode,
+                                void* fi) {
+    RememberFuseSession(req);
+    const HiddenNamedTargetKind kind = ClassifyHiddenNamedTarget(ReqUid(req), parent, name);
+    if (ReplyHiddenNamedTargetError(req, "pf_create", kind, EPERM, ENOENT)) {
+        return;
+    }
+    auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, const char*, uint32_t, void*)>(
+        gOriginalPfCreate);
+    if (fn) {
+        fn(req, parent, name, mode, fi);
+    }
+}
+
+extern "C" void WrappedPfReaddir(fuse_req_t req, uint64_t ino, size_t size, off_t off, void* fi) {
+    RememberFuseSession(req);
+    const uint32_t uid = ReqUid(req);
+    auto fn =
+        reinterpret_cast<void (*)(fuse_req_t, uint64_t, size_t, off_t, void*)>(gOriginalPfReaddir);
+    if (fn == nullptr) {
+        return;
+    }
+    DebugLogPrint(3, "pf_readdir uid=%u ino=%s size=%zu off=%lld", static_cast<unsigned>(uid),
+                  InodePath(ino).c_str(), size, static_cast<long long>(off));
+    gInPfReaddir = true;
+    gPfReaddirUid = uid;
+    gPfReaddirIno = ino;
+    fn(req, ino, size, off, fi);
+    gPfReaddirIno = 0;
+    gPfReaddirUid = 0;
+    gInPfReaddir = false;
+}
+
+extern "C" void WrappedPfReaddirplus(fuse_req_t req, uint64_t ino, size_t size, off_t off,
+                                     void* fi) {
+    RememberFuseSession(req);
+    const uint32_t uid = ReqUid(req);
+    auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, size_t, off_t, void*)>(
+        gOriginalPfReaddirplus);
+    if (fn == nullptr) {
+        return;
+    }
+    DebugLogPrint(3, "pf_readdirplus uid=%u ino=%s size=%zu off=%lld", static_cast<unsigned>(uid),
+                  InodePath(ino).c_str(), size, static_cast<long long>(off));
+    gInPfReaddirplus = true;
+    gPfReaddirUid = uid;
+    gPfReaddirIno = ino;
+    fn(req, ino, size, off, fi);
+    gPfReaddirIno = 0;
+    gPfReaddirUid = 0;
+    gInPfReaddirplus = false;
+}
+
 extern "C" int WrappedNotifyInvalEntry(void* se, uint64_t parent, const char* name,
                                        size_t namelen) {
     auto fn =
         reinterpret_cast<int (*)(void*, uint64_t, const char*, size_t)>(gOriginalNotifyInvalEntry);
     int ret = fn ? fn(se, parent, name, namelen) : -1;
-    __android_log_print(3, kLogTag, "notify_inval_entry: ino=0x%lx name=%s ret=%d",
-                        (unsigned long)parent,
-                        name ? DebugPreview(std::string_view(name, namelen)).c_str() : "null", ret);
+    DebugLogPrint(3, "notify_inval_entry: ino=0x%lx name=%s ret=%d", (unsigned long)parent,
+                  name ? DebugPreview(std::string_view(name, namelen)).c_str() : "null", ret);
     return ret;
 }
 
@@ -820,33 +1599,155 @@ extern "C" int WrappedNotifyInvalInode(void* se, uint64_t ino, off_t off, off_t 
     // Device libfuse_jni routes a fallback invalidation path through notify_inval_inode().
     // The callback receives an inode handle, not a verified node object, so only log the rawvalue
     // here.
-    __android_log_print(3, kLogTag, "notify_inval_inode: ino=0x%lx name=%s ret=%d",
-                        (unsigned long)ino, ino == 1 ? "(ROOT)" : "", ret);
+    DebugLogPrint(3, "notify_inval_inode: ino=0x%lx name=%s ret=%d", (unsigned long)ino,
+                  ino == 1 ? "(ROOT)" : "", ret);
     return ret;
 }
 
 extern "C" int WrappedReplyEntry(fuse_req_t req, const struct fuse_entry_param* e) {
     auto fn =
         reinterpret_cast<int (*)(fuse_req_t, const struct fuse_entry_param*)>(gOriginalReplyEntry);
-    int ret = fn ? fn(req, e) : -1;
-    __android_log_print(
-        3, kLogTag,
-        "fuse_reply_entry: req=%lu ino=%s timeout=%.2le attr_timeout=%.2le bpf_fd=%lu "
-        "bpf_action=%lu backing_action=%lu backing_fd=%lu ret=%d",
-        (unsigned long)req->unique, InodePath(e->ino).c_str(), e->entry_timeout, e->attr_timeout,
-        (unsigned long)e->bpf_fd, (unsigned long)e->bpf_action, (unsigned long)e->backing_action,
-        (unsigned long)e->backing_fd, ret);
+    const bool hiddenLookupForUid =
+        IsTestHiddenUid(ReqUid(req)) && (gTrackRootHiddenLookup || gTrackHiddenSubtreeLookup);
+    if (hiddenLookupForUid) {
+        auto replyErr = reinterpret_cast<int (*)(fuse_req_t, int)>(gOriginalReplyErr);
+        const int ret = replyErr ? replyErr(req, ENOENT) : -1;
+        DebugLogPrint(4, "hide lookup entry uid=%u req=%lu ino=%s root=%d child=%d ret=%d",
+                      static_cast<unsigned>(ReqUid(req)), req ? (unsigned long)req->unique : 0UL,
+                      e != nullptr ? InodePath(e->ino).c_str() : "(null)",
+                      gTrackRootHiddenLookup ? 1 : 0, gTrackHiddenSubtreeLookup ? 1 : 0, ret);
+        ScheduleHiddenEntryInvalidation();
+        return ret;
+    }
+    fuse_entry_param patchedEntry = {};
+    const struct fuse_entry_param* replyEntry = e;
+    if (e != nullptr && (gTrackRootHiddenLookup || gTrackHiddenSubtreeLookup)) {
+        patchedEntry = *e;
+        patchedEntry.entry_timeout = 0.0;
+        patchedEntry.attr_timeout = 0.0;
+        replyEntry = &patchedEntry;
+        DebugLogPrint(4, "disable entry cache req=%lu ino=%s root=%d child=%d",
+                      req ? (unsigned long)req->unique : 0UL, InodePath(e->ino).c_str(),
+                      gTrackRootHiddenLookup ? 1 : 0, gTrackHiddenSubtreeLookup ? 1 : 0);
+        ScheduleHiddenEntryInvalidation();
+        if (TrackHiddenSubtreeInode(e->ino)) {
+            ScheduleHiddenInodeInvalidation(e->ino);
+        }
+    }
+    int ret = fn ? fn(req, replyEntry) : -1;
+    DebugLogPrint(3,
+                  "fuse_reply_entry: req=%lu ino=%s timeout=%.2le attr_timeout=%.2le bpf_fd=%lu "
+                  "bpf_action=%lu backing_action=%lu backing_fd=%lu ret=%d",
+                  (unsigned long)req->unique, InodePath(replyEntry->ino).c_str(),
+                  replyEntry->entry_timeout, replyEntry->attr_timeout,
+                  (unsigned long)replyEntry->bpf_fd, (unsigned long)replyEntry->bpf_action,
+                  (unsigned long)replyEntry->backing_action, (unsigned long)replyEntry->backing_fd,
+                  ret);
     return ret;
+}
+
+extern "C" int WrappedReplyAttr(fuse_req_t req, const struct stat* attr, double timeout) {
+    auto fn = reinterpret_cast<int (*)(fuse_req_t, const struct stat*, double)>(gOriginalReplyAttr);
+    const double replyTimeout = gZeroAttrCacheForCurrentGetattr ? 0.0 : timeout;
+    if (gZeroAttrCacheForCurrentGetattr) {
+        DebugLogPrint(4, "disable attr cache req=%p timeout=%.2le", req, replyTimeout);
+    }
+    return fn ? fn(req, attr, replyTimeout) : -1;
 }
 
 extern "C" int WrappedReplyBuf(fuse_req_t req, const char* buf, size_t size) {
     auto fn = reinterpret_cast<int (*)(fuse_req_t, const char*, size_t)>(gOriginalReplyBuf);
-    int ret = fn ? fn(req, buf, size) : -1;
+    const char* replyBuf = buf;
+    size_t replySize = size;
+    std::vector<char> filteredStorage;
+    size_t removedCount = 0;
+    const uint32_t reqUid = ReqUid(req);
+    const uint32_t filterUid = gPfReaddirUid != 0 ? gPfReaddirUid : reqUid;
+    const uint64_t filterIno = gPfReaddirIno != 0 ? gPfReaddirIno : 0;
+    const bool filterPlainReaddir = gInPfReaddir;
+    const bool filterPostfilterReaddir = gInPfReaddirPostfilter;
+    const bool filterReaddirplus = gInPfReaddirplus;
+    const bool requireParentMatch = filterIno != 0;
+    const char* filterMode = nullptr;
+
+    if (IsTestHiddenUid(filterUid)) {
+        if (filterPlainReaddir) {
+            if (BuildFilteredDirentPayload(buf, size, filterUid, filterIno, &filteredStorage,
+                                           &removedCount, requireParentMatch)) {
+                replyBuf = filteredStorage.data();
+                replySize = filteredStorage.size();
+                filterMode = "readdir";
+            }
+        } else if (filterReaddirplus) {
+            if (BuildFilteredDirentplusPayload(buf, size, filterUid, filterIno, &filteredStorage,
+                                               &removedCount, requireParentMatch)) {
+                replyBuf = filteredStorage.data();
+                replySize = filteredStorage.size();
+                filterMode = "readdirplus";
+            }
+        } else if (filterPostfilterReaddir && size >= sizeof(fuse_read_out)) {
+            const auto* readOut = reinterpret_cast<const fuse_read_out*>(buf);
+            const size_t payloadSize =
+                std::min<size_t>(readOut->size, size - sizeof(fuse_read_out));
+            std::vector<char> filteredPayload;
+            if (BuildFilteredDirentPayload(buf + sizeof(fuse_read_out), payloadSize, filterUid,
+                                           filterIno, &filteredPayload, &removedCount,
+                                           requireParentMatch)) {
+                fuse_read_out patched = *readOut;
+                patched.size = static_cast<uint32_t>(filteredPayload.size());
+                filteredStorage.resize(sizeof(patched) + filteredPayload.size());
+                std::memcpy(filteredStorage.data(), &patched, sizeof(patched));
+                std::memcpy(filteredStorage.data() + sizeof(patched), filteredPayload.data(),
+                            filteredPayload.size());
+                replyBuf = filteredStorage.data();
+                replySize = filteredStorage.size();
+                filterMode = "readdir_postfilter";
+            }
+        }
+
+        if (filterMode == nullptr) {
+            if (BuildFilteredDirentplusPayload(buf, size, filterUid, 0, &filteredStorage,
+                                               &removedCount, false)) {
+                replyBuf = filteredStorage.data();
+                replySize = filteredStorage.size();
+                filterMode = "auto_direntplus";
+            } else if (BuildFilteredDirentPayload(buf, size, filterUid, 0, &filteredStorage,
+                                                  &removedCount, false)) {
+                replyBuf = filteredStorage.data();
+                replySize = filteredStorage.size();
+                filterMode = "auto_dirent";
+            } else if (size >= sizeof(fuse_read_out)) {
+                const auto* readOut = reinterpret_cast<const fuse_read_out*>(buf);
+                const size_t payloadSize =
+                    std::min<size_t>(readOut->size, size - sizeof(fuse_read_out));
+                std::vector<char> filteredPayload;
+                if (BuildFilteredDirentPayload(buf + sizeof(fuse_read_out), payloadSize, filterUid,
+                                               0, &filteredPayload, &removedCount, false)) {
+                    fuse_read_out patched = *readOut;
+                    patched.size = static_cast<uint32_t>(filteredPayload.size());
+                    filteredStorage.resize(sizeof(patched) + filteredPayload.size());
+                    std::memcpy(filteredStorage.data(), &patched, sizeof(patched));
+                    std::memcpy(filteredStorage.data() + sizeof(patched), filteredPayload.data(),
+                                filteredPayload.size());
+                    replyBuf = filteredStorage.data();
+                    replySize = filteredStorage.size();
+                    filterMode = "auto_read_out_dirent";
+                }
+            }
+        }
+    }
+
+    int ret = fn ? fn(req, replyBuf, replySize) : -1;
+    if (removedCount != 0) {
+        DebugLogPrint(4, "filtered readdir reply mode=%s uid=%u ino=%s removed=%zu size=%zu->%zu",
+                      filterMode ? filterMode : "unknown", static_cast<unsigned>(filterUid),
+                      InodePath(filterIno).c_str(), removedCount, size, replySize);
+    }
     if (gInPfLookupPostfilter) {
-        __android_log_print(3, kLogTag, "pf_lookup_postfilter fuse_reply_buf req=%p", req);
+        DebugLogPrint(3, "pf_lookup_postfilter fuse_reply_buf req=%p", req);
     } else {
-        __android_log_print(3, kLogTag, "fuse_reply_buf: req=%lu size=%zu ret=%d",
-                            (unsigned long)req->unique, size, ret);
+        DebugLogPrint(3, "fuse_reply_buf: req=%lu size=%zu ret=%d", (unsigned long)req->unique,
+                      replySize, ret);
     }
     return ret;
 }
@@ -855,14 +1756,179 @@ extern "C" int WrappedReplyErr(fuse_req_t req, int err) {
     auto fn = reinterpret_cast<int (*)(fuse_req_t, int)>(gOriginalReplyErr);
     int ret = fn ? fn(req, err) : -1;
     if (gInPfLookupPostfilter) {
-        __android_log_print(3, kLogTag, "pf_lookup_postfilter fuse_reply_err req=%p %d", req, err);
+        DebugLogPrint(3, "pf_lookup_postfilter fuse_reply_err req=%p %d", req, err);
     } else {
-        __android_log_print(3, kLogTag, "fuse_reply_err: req=%p err=%d ret=%d", req, err, ret);
+        DebugLogPrint(3, "fuse_reply_err: req=%p err=%d ret=%d", req, err, ret);
     }
     return ret;
 }
 
+extern "C" void WrappedPfGetattr(fuse_req_t req, uint64_t ino, void* fi) {
+    RememberFuseSession(req);
+    const uint32_t uid = ReqUid(req);
+    gZeroAttrCacheForCurrentGetattr = IsTrackedHiddenSubtreeInode(ino);
+    if (IsTestHiddenUid(uid)) {
+        DebugLogPrint(4, "pf_getattr test uid=%u ino=0x%lx", static_cast<unsigned>(uid),
+                      (unsigned long)ino);
+    }
+    auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, void*)>(gOriginalPfGetattr);
+    if (fn) {
+        gInPfGetattr = true;
+        gPfGetattrUid = uid;
+        gPfGetattrIno = ino;
+        fn(req, ino, fi);
+        gPfGetattrIno = 0;
+        gPfGetattrUid = 0;
+        gInPfGetattr = false;
+        gZeroAttrCacheForCurrentGetattr = false;
+    }
+}
+
+extern "C" int WrappedLstat(const char* path, struct stat* st) {
+    const std::string_view pathView = path != nullptr ? std::string_view(path) : std::string_view();
+    if (gInPfGetattr && gPfGetattrIno != 0 && IsHiddenRootDirectoryPath(pathView)) {
+        uint64_t expected = 0;
+        if (gHiddenRootParentInode.compare_exchange_strong(expected, gPfGetattrIno,
+                                                           std::memory_order_relaxed)) {
+            DebugLogPrint(4, "record hidden root parent from getattr=%s path=%s",
+                          InodePath(gPfGetattrIno).c_str(), DebugPreview(pathView).c_str());
+        }
+        RemoveTrackedHiddenSubtreeInode(gPfGetattrIno);
+    }
+    NoteHiddenSubtreePathForCache(pathView);
+    if (gInPfGetattr && IsTestHiddenUid(gPfGetattrUid)) {
+        DebugLogPrint(4, "pf_getattr lstat uid=%u path=%s", static_cast<unsigned>(gPfGetattrUid),
+                      DebugPreview(pathView).c_str());
+        if (ShouldHideTestPath(gPfGetattrUid, pathView)) {
+            DebugLogPrint(4, "hide test lstat uid=%u path=%s", static_cast<unsigned>(gPfGetattrUid),
+                          DebugPreview(pathView).c_str());
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    auto fn = reinterpret_cast<int (*)(const char*, struct stat*)>(gOriginalLstat);
+    if (fn) {
+        return fn(path, st);
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" int WrappedStat(const char* path, struct stat* st) {
+    const std::string_view pathView = path != nullptr ? std::string_view(path) : std::string_view();
+    if (gInPfReaddirPostfilter && IsTestHiddenUid(gPfReaddirUid) &&
+        IsAnyHiddenSubtreePath(pathView)) {
+        DebugLogPrint(4, "hide readdir stat uid=%u path=%s", static_cast<unsigned>(gPfReaddirUid),
+                      DebugPreview(pathView).c_str());
+        errno = ENOENT;
+        return -1;
+    }
+    auto fn = reinterpret_cast<int (*)(const char*, struct stat*)>(gOriginalStat);
+    if (fn) {
+        return fn(path, st);
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" int WrappedMkdirLibc(const char* path, mode_t mode) {
+    const std::string_view pathView = path != nullptr ? std::string_view(path) : std::string_view();
+    if (IsExactHiddenTargetPath(pathView)) {
+        DebugLogPrint(4, "hide mkdir path=%s", DebugPreview(pathView).c_str());
+        errno = EACCES;
+        return -1;
+    }
+    auto fn = reinterpret_cast<int (*)(const char*, mode_t)>(gOriginalMkdir);
+    if (fn) {
+        return fn(path, mode);
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" int WrappedMknod(const char* path, mode_t mode, dev_t dev) {
+    const std::string_view pathView = path != nullptr ? std::string_view(path) : std::string_view();
+    if (IsExactHiddenTargetPath(pathView)) {
+        DebugLogPrint(4, "hide mknod path=%s", DebugPreview(pathView).c_str());
+        errno = EPERM;
+        return -1;
+    }
+    auto fn = reinterpret_cast<int (*)(const char*, mode_t, dev_t)>(gOriginalMknod);
+    if (fn) {
+        return fn(path, mode, dev);
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" int WrappedOpen(const char* path, int flags, ...) {
+    mode_t mode = 0;
+    if ((flags & O_CREAT) != 0) {
+        va_list args;
+        va_start(args, flags);
+        mode = static_cast<mode_t>(va_arg(args, int));
+        va_end(args);
+    }
+    const std::string_view pathView = path != nullptr ? std::string_view(path) : std::string_view();
+    if ((flags & O_CREAT) != 0 && IsExactHiddenTargetPath(pathView)) {
+        DebugLogPrint(4, "hide open create path=%s flags=0x%x", DebugPreview(pathView).c_str(),
+                      flags);
+        errno = EPERM;
+        return -1;
+    }
+    auto fn = reinterpret_cast<int (*)(const char*, int, ...)>(gOriginalOpen);
+    if (fn) {
+        if ((flags & O_CREAT) != 0) {
+            return fn(path, flags, mode);
+        }
+        return fn(path, flags);
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" int WrappedOpen2(const char* path, int flags) {
+    const std::string_view pathView = path != nullptr ? std::string_view(path) : std::string_view();
+    if ((flags & O_CREAT) != 0 && IsExactHiddenTargetPath(pathView)) {
+        DebugLogPrint(4, "hide __open_2 create path=%s flags=0x%x", DebugPreview(pathView).c_str(),
+                      flags);
+        errno = EPERM;
+        return -1;
+    }
+    auto fn = reinterpret_cast<int (*)(const char*, int)>(gOriginalOpen2);
+    if (fn) {
+        return fn(path, flags);
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
 // Path hook wrappers
+
+bool IsTestHiddenUid(uint32_t uid) {
+    {
+        std::lock_guard<std::mutex> lock(gUidHideCacheMutex);
+        const auto it = gUidHideCache.find(uid);
+        if (it != gUidHideCache.end()) {
+            return it->second;
+        }
+    }
+
+    const std::optional<bool> resolved = ResolveShouldHideUidWithPackageManager(uid);
+    if (!resolved.has_value()) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(gUidHideCacheMutex);
+        gUidHideCache[uid] = *resolved;
+    }
+    return *resolved;
+}
+
+bool ShouldHideTestPath(uint32_t uid, std::string_view path) {
+    return IsTestHiddenUid(uid) && IsAnyHiddenSubtreePath(path);
+}
 
 // WrappedIsAppAccessiblePath
 // Original: check NeedsSanitization → if no, call original directly.
@@ -874,16 +1940,28 @@ bool WrappedIsAppAccessiblePath(void* fuse, const std::string& path, uint32_t ui
     if (!NeedsSanitization(path)) {
         LogSuspiciousDirectPath("app_accessible", path);
         if (ShouldLogLimited(gAppAccessibleLogCount)) {
-            __android_log_print(3, kLogTag, "app_accessible direct uid=%u path=%s", uid,
-                                DebugPreview(path).c_str());
+            DebugLogPrint(3, "app_accessible direct uid=%u path=%s", uid,
+                          DebugPreview(path).c_str());
+        }
+        NoteHiddenSubtreePathForCache(path);
+        if (ShouldHideTestPath(uid, path)) {
+            DebugLogPrint(4, "hide test path uid=%u path=%s", static_cast<unsigned>(uid),
+                          DebugPreview(path).c_str());
+            return false;
         }
         return gOriginalIsAppAccessiblePath(fuse, path, uid);
     }
     std::string sanitized(path);
     RewriteString(sanitized);
     if (ShouldLogLimited(gAppAccessibleLogCount)) {
-        __android_log_print(3, kLogTag, "app_accessible rewrite uid=%u old=%s new=%s", uid,
-                            DebugPreview(path).c_str(), DebugPreview(sanitized).c_str());
+        DebugLogPrint(3, "app_accessible rewrite uid=%u old=%s new=%s", uid,
+                      DebugPreview(path).c_str(), DebugPreview(sanitized).c_str());
+    }
+    NoteHiddenSubtreePathForCache(sanitized);
+    if (ShouldHideTestPath(uid, sanitized)) {
+        DebugLogPrint(4, "hide test path uid=%u path=%s src=%s", static_cast<unsigned>(uid),
+                      DebugPreview(sanitized).c_str(), DebugPreview(path).c_str());
+        return false;
     }
     return gOriginalIsAppAccessiblePath(fuse, sanitized, uid);
 }
@@ -899,17 +1977,16 @@ bool WrappedIsPackageOwnedPath(const std::string& lhs, const std::string& rhs) {
     if (!NeedsSanitization(lhs)) {
         LogSuspiciousDirectPath("package_owned", lhs);
         if (ShouldLogLimited(gPackageOwnedLogCount)) {
-            __android_log_print(3, kLogTag, "package_owned direct lhs=%s rhs=%s",
-                                DebugPreview(lhs).c_str(), DebugPreview(rhs).c_str());
+            DebugLogPrint(3, "package_owned direct lhs=%s rhs=%s", DebugPreview(lhs).c_str(),
+                          DebugPreview(rhs).c_str());
         }
         return gOriginalIsPackageOwnedPath(lhs, rhs);
     }
     std::string sanitizedLhs(lhs);
     RewriteString(sanitizedLhs);
     if (ShouldLogLimited(gPackageOwnedLogCount)) {
-        __android_log_print(3, kLogTag, "package_owned rewrite lhs=%s new=%s rhs=%s",
-                            DebugPreview(lhs).c_str(), DebugPreview(sanitizedLhs).c_str(),
-                            DebugPreview(rhs).c_str());
+        DebugLogPrint(3, "package_owned rewrite lhs=%s new=%s rhs=%s", DebugPreview(lhs).c_str(),
+                      DebugPreview(sanitizedLhs).c_str(), DebugPreview(rhs).c_str());
     }
     return gOriginalIsPackageOwnedPath(sanitizedLhs, rhs);
 }
@@ -922,16 +1999,15 @@ bool WrappedIsBpfBackingPath(const std::string& path) {
     if (!NeedsSanitization(path)) {
         LogSuspiciousDirectPath("bpf_backing", path);
         if (ShouldLogLimited(gBpfBackingLogCount)) {
-            __android_log_print(3, kLogTag, "bpf_backing direct path=%s",
-                                DebugPreview(path).c_str());
+            DebugLogPrint(3, "bpf_backing direct path=%s", DebugPreview(path).c_str());
         }
         return gOriginalIsBpfBackingPath(path);
     }
     std::string sanitized(path);
     RewriteString(sanitized);
     if (ShouldLogLimited(gBpfBackingLogCount)) {
-        __android_log_print(3, kLogTag, "bpf_backing rewrite old=%s new=%s",
-                            DebugPreview(path).c_str(), DebugPreview(sanitized).c_str());
+        DebugLogPrint(3, "bpf_backing rewrite old=%s new=%s", DebugPreview(path).c_str(),
+                      DebugPreview(sanitized).c_str());
     }
     return gOriginalIsBpfBackingPath(sanitized);
 }
@@ -945,9 +2021,9 @@ extern "C" int WrappedStrcasecmp(const char* lhs, const char* rhs) {
         reinterpret_cast<const uint8_t*>(lhs ? lhs : ""), lhsLen,
         reinterpret_cast<const uint8_t*>(rhs ? rhs : ""), rhsLen);
     if (ShouldLogLimited(gStrcasecmpLogCount)) {
-        __android_log_print(3, kLogTag, "strcasecmp lhs=%s rhs=%s result=%d",
-                            DebugPreview(std::string_view(lhs ? lhs : "", lhsLen)).c_str(),
-                            DebugPreview(std::string_view(rhs ? rhs : "", rhsLen)).c_str(), result);
+        DebugLogPrint(3, "strcasecmp lhs=%s rhs=%s result=%d",
+                      DebugPreview(std::string_view(lhs ? lhs : "", lhsLen)).c_str(),
+                      DebugPreview(std::string_view(rhs ? rhs : "", rhsLen)).c_str(), result);
     }
     return result;
 }
@@ -959,10 +2035,10 @@ extern "C" bool WrappedEqualsIgnoreCaseAbi(const char* lhsData, size_t lhsSize, 
         reinterpret_cast<const uint8_t*>(lhsData ? lhsData : ""), lhsSize,
         reinterpret_cast<const uint8_t*>(rhsData ? rhsData : ""), rhsSize);
     if (ShouldLogLimited(gEqualsIgnoreCaseLogCount)) {
-        __android_log_print(3, kLogTag, "equals_ignore_case lhs=%s rhs=%s result=%d",
-                            DebugPreview(std::string_view(lhsData ? lhsData : "", lhsSize)).c_str(),
-                            DebugPreview(std::string_view(rhsData ? rhsData : "", rhsSize)).c_str(),
-                            result);
+        DebugLogPrint(3, "equals_ignore_case lhs=%s rhs=%s result=%d",
+                      DebugPreview(std::string_view(lhsData ? lhsData : "", lhsSize)).c_str(),
+                      DebugPreview(std::string_view(rhsData ? rhsData : "", rhsSize)).c_str(),
+                      result);
     }
     return result == 0;
 }
@@ -2466,6 +3542,12 @@ void InstallMinimalCoreHooks(const ModuleInfo& module, const FileElfContext& fil
                                    reinterpret_cast<void*>(+WrappedEqualsIgnoreCaseAbi),
                                    &gOriginalEqualsIgnoreCase, "EqualsIgnoreCase");
 
+    if (gOriginalShouldNotCache == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDeviceShouldNotCacheOffset),
+                               (void*)WrappedShouldNotCache, &gOriginalShouldNotCache,
+                               "hook ShouldNotCache failed");
+    }
+
     RefreshCoreHookStatus(module, status);
 }
 
@@ -2478,15 +3560,104 @@ void InstallMinimalDebugHooks(const ModuleInfo& module, const FileElfContext& fi
         (void*)WrappedNotifyInvalInode, &gOriginalNotifyInvalInode, "notify_inval_inode");
     InstallFileCompareHookIfNeeded(fileContext.elfInfo, "fuse_reply_entry", "fuse_reply_entry",
                                    (void*)WrappedReplyEntry, &gOriginalReplyEntry, "reply_entry");
+    InstallFileCompareHookIfNeeded(fileContext.elfInfo, "fuse_reply_attr", "fuse_reply_attr",
+                                   (void*)WrappedReplyAttr, &gOriginalReplyAttr, "reply_attr");
     InstallFileCompareHookIfNeeded(fileContext.elfInfo, "fuse_reply_buf", "fuse_reply_buf",
                                    (void*)WrappedReplyBuf, &gOriginalReplyBuf, "reply_buf");
     InstallFileCompareHookIfNeeded(fileContext.elfInfo, "fuse_reply_err", "fuse_reply_err",
                                    (void*)WrappedReplyErr, &gOriginalReplyErr, "reply_err");
+    InstallFileCompareHookIfNeeded(fileContext.elfInfo, "lstat", "lstat", (void*)WrappedLstat,
+                                   &gOriginalLstat, "lstat");
+    InstallFileCompareHookIfNeeded(fileContext.elfInfo, "stat", "stat", (void*)WrappedStat,
+                                   &gOriginalStat, "stat");
+    InstallFileCompareHookIfNeeded(fileContext.elfInfo, "mkdir", "mkdir", (void*)WrappedMkdirLibc,
+                                   &gOriginalMkdir, "mkdir");
+    InstallFileCompareHookIfNeeded(fileContext.elfInfo, "mknod", "mknod", (void*)WrappedMknod,
+                                   &gOriginalMknod, "mknod");
+    InstallFileCompareHookIfNeeded(fileContext.elfInfo, "open", "open", (void*)WrappedOpen,
+                                   &gOriginalOpen, "open");
+    InstallFileCompareHookIfNeeded(fileContext.elfInfo, "__open_2", "__open_2", (void*)WrappedOpen2,
+                                   &gOriginalOpen2, "__open_2");
+    if (gOriginalGetDirectoryEntries == nullptr) {
+        TryInstallInlineHookAt(
+            reinterpret_cast<void*>(module.base + kDeviceGetDirectoryEntriesOffset),
+            (void*)WrappedGetDirectoryEntries, &gOriginalGetDirectoryEntries,
+            "hook GetDirectoryEntries failed");
+    }
+    if (gOriginalPfMkdir == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfMkdirOffset),
+                               (void*)WrappedPfMkdir, &gOriginalPfMkdir, "hook pf_mkdir failed");
+    }
+    if (gOriginalPfMknod == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfMknodOffset),
+                               (void*)WrappedPfMknod, &gOriginalPfMknod, "hook pf_mknod failed");
+    }
+    if (gOriginalPfUnlink == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfUnlinkOffset),
+                               (void*)WrappedPfUnlink, &gOriginalPfUnlink, "hook pf_unlink failed");
+    }
+    if (gOriginalPfRmdir == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfRmdirOffset),
+                               (void*)WrappedPfRmdir, &gOriginalPfRmdir, "hook pf_rmdir failed");
+    }
+    if (gOriginalPfCreate == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfCreateOffset),
+                               (void*)WrappedPfCreate, &gOriginalPfCreate, "hook pf_create failed");
+    }
+    if (gOriginalPfReaddir == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfReaddirOffset),
+                               (void*)WrappedPfReaddir, &gOriginalPfReaddir,
+                               "hook pf_readdir failed");
+    }
+    if (gOriginalPfReaddirplus == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfReaddirplusOffset),
+                               (void*)WrappedPfReaddirplus, &gOriginalPfReaddirplus,
+                               "hook pf_readdirplus failed");
+    }
+    if (gOriginalPfReaddirPostfilter == nullptr) {
+        TryInstallInlineHookAt(
+            reinterpret_cast<void*>(module.base + kDevicePfReaddirPostfilterOffset),
+            (void*)WrappedPfReaddirPostfilter, &gOriginalPfReaddirPostfilter,
+            "hook pf_readdir_postfilter failed");
+    }
 
     if (gOriginalPfLookup == nullptr) {
         TryInstallFileInlineHook(module, "_ZN13mediaprovider4fuseL9pf_lookupEP8fuse_reqmPKc",
                                  (void*)WrappedPfLookup, &gOriginalPfLookup,
                                  "hook pf_lookup failed");
+    }
+    if (gOriginalPfAccess == nullptr) {
+        TryInstallFileInlineHook(module, "_ZN13mediaprovider4fuseL9pf_accessEP8fuse_reqmi",
+                                 (void*)WrappedPfAccess, &gOriginalPfAccess,
+                                 "hook pf_access failed");
+    }
+    if (gOriginalPfOpen == nullptr) {
+        TryInstallFileInlineHook(module,
+                                 "_ZN13mediaprovider4fuseL7pf_openEP8fuse_reqmP14fuse_file_info",
+                                 (void*)WrappedPfOpen, &gOriginalPfOpen, "hook pf_open failed");
+    }
+    if (gOriginalPfOpendir == nullptr) {
+        TryInstallFileInlineHook(
+            module, "_ZN13mediaprovider4fuseL10pf_opendirEP8fuse_reqmP14fuse_file_info",
+            (void*)WrappedPfOpendir, &gOriginalPfOpendir, "hook pf_opendir failed");
+    }
+    if (gOriginalPfMkdir == nullptr) {
+        TryInstallFileInlineHook(module, "_ZN13mediaprovider4fuseL8pf_mkdirEP8fuse_reqmPKcj",
+                                 (void*)WrappedPfMkdir, &gOriginalPfMkdir, "hook pf_mkdir failed");
+    }
+    if (gOriginalPfUnlink == nullptr) {
+        TryInstallFileInlineHook(module, "_ZN13mediaprovider4fuseL9pf_unlinkEP8fuse_reqmPKc",
+                                 (void*)WrappedPfUnlink, &gOriginalPfUnlink,
+                                 "hook pf_unlink failed");
+    }
+    if (gOriginalPfRmdir == nullptr) {
+        TryInstallFileInlineHook(module, "_ZN13mediaprovider4fuseL8pf_rmdirEP8fuse_reqmPKc",
+                                 (void*)WrappedPfRmdir, &gOriginalPfRmdir, "hook pf_rmdir failed");
+    }
+    if (gOriginalPfCreate == nullptr) {
+        TryInstallFileInlineHook(
+            module, "_ZN13mediaprovider4fuseL9pf_createEP8fuse_reqmPKcjP14fuse_file_info",
+            (void*)WrappedPfCreate, &gOriginalPfCreate, "hook pf_create failed");
     }
     if (gOriginalPfLookupPostfilter == nullptr) {
         TryInstallFileInlineHook(module,
@@ -2495,6 +3666,11 @@ void InstallMinimalDebugHooks(const ModuleInfo& module, const FileElfContext& fi
                                  "entry_bpf_out",
                                  (void*)WrappedPfLookupPostfilter, &gOriginalPfLookupPostfilter,
                                  "hook pf_lookup_postfilter failed");
+    }
+    if (gOriginalPfGetattr == nullptr) {
+        TryInstallFileInlineHook(
+            module, "_ZN13mediaprovider4fuseL10pf_getattrEP8fuse_reqmP14fuse_file_info",
+            (void*)WrappedPfGetattr, &gOriginalPfGetattr, "hook pf_getattr failed");
     }
 }
 
@@ -2553,6 +3729,12 @@ void InstallAdvancedCoreHooks(const ModuleInfo& module, CoreHookStatus* status) 
         }
     }
 
+    if (gOriginalShouldNotCache == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDeviceShouldNotCacheOffset),
+                               (void*)WrappedShouldNotCache, &gOriginalShouldNotCache,
+                               "hook ShouldNotCache failed");
+    }
+
     RefreshCoreHookStatus(module, status);
 }
 
@@ -2575,20 +3757,108 @@ void InstallAdvancedDebugHooks(const ModuleInfo& module) {
             PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "fuse_reply_entry",
                                         "fuse_reply_entry", (void*)WrappedReplyEntry,
                                         &gOriginalReplyEntry, "reply_entry");
+            PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "fuse_reply_attr",
+                                        "fuse_reply_attr", (void*)WrappedReplyAttr,
+                                        &gOriginalReplyAttr, "reply_attr");
             PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "fuse_reply_buf",
                                         "fuse_reply_buf", (void*)WrappedReplyBuf,
                                         &gOriginalReplyBuf, "reply_buf");
             PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "fuse_reply_err",
                                         "fuse_reply_err", (void*)WrappedReplyErr,
                                         &gOriginalReplyErr, "reply_err");
+            PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "lstat", "lstat",
+                                        (void*)WrappedLstat, &gOriginalLstat, "lstat");
+            PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "stat", "stat",
+                                        (void*)WrappedStat, &gOriginalStat, "stat");
+            PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "mkdir", "mkdir",
+                                        (void*)WrappedMkdirLibc, &gOriginalMkdir, "mkdir");
+            PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "mknod", "mknod",
+                                        (void*)WrappedMknod, &gOriginalMknod, "mknod");
+            PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "open", "open",
+                                        (void*)WrappedOpen, &gOriginalOpen, "open");
+            PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "__open_2",
+                                        "__open_2", (void*)WrappedOpen2, &gOriginalOpen2,
+                                        "__open_2");
         }
     } else if (auto fileContext = BuildFileElfContext(module); fileContext.has_value()) {
         InstallMinimalDebugHooks(module, *fileContext);
     }
 
+    if (gOriginalGetDirectoryEntries == nullptr) {
+        TryInstallInlineHookAt(
+            reinterpret_cast<void*>(module.base + kDeviceGetDirectoryEntriesOffset),
+            (void*)WrappedGetDirectoryEntries, &gOriginalGetDirectoryEntries,
+            "hook GetDirectoryEntries failed");
+    }
+    if (gOriginalPfMkdir == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfMkdirOffset),
+                               (void*)WrappedPfMkdir, &gOriginalPfMkdir, "hook pf_mkdir failed");
+    }
+    if (gOriginalPfUnlink == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfUnlinkOffset),
+                               (void*)WrappedPfUnlink, &gOriginalPfUnlink, "hook pf_unlink failed");
+    }
+    if (gOriginalPfRmdir == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfRmdirOffset),
+                               (void*)WrappedPfRmdir, &gOriginalPfRmdir, "hook pf_rmdir failed");
+    }
+    if (gOriginalPfCreate == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfCreateOffset),
+                               (void*)WrappedPfCreate, &gOriginalPfCreate, "hook pf_create failed");
+    }
+    if (gOriginalPfReaddir == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfReaddirOffset),
+                               (void*)WrappedPfReaddir, &gOriginalPfReaddir,
+                               "hook pf_readdir failed");
+    }
+    if (gOriginalPfReaddirplus == nullptr) {
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDevicePfReaddirplusOffset),
+                               (void*)WrappedPfReaddirplus, &gOriginalPfReaddirplus,
+                               "hook pf_readdirplus failed");
+    }
+    if (gOriginalPfReaddirPostfilter == nullptr) {
+        TryInstallInlineHookAt(
+            reinterpret_cast<void*>(module.base + kDevicePfReaddirPostfilterOffset),
+            (void*)WrappedPfReaddirPostfilter, &gOriginalPfReaddirPostfilter,
+            "hook pf_readdir_postfilter failed");
+    }
+
     if (gOriginalPfLookup == nullptr) {
         InstallHookForSymbol("_ZN13mediaprovider4fuseL9pf_lookupEP8fuse_reqmPKc",
                              (void*)WrappedPfLookup, &gOriginalPfLookup, "hook pf_lookup failed");
+    }
+    if (gOriginalPfAccess == nullptr) {
+        InstallHookForSymbol("_ZN13mediaprovider4fuseL9pf_accessEP8fuse_reqmi",
+                             (void*)WrappedPfAccess, &gOriginalPfAccess, "hook pf_access failed");
+    }
+    if (gOriginalPfOpen == nullptr) {
+        InstallHookForSymbol("_ZN13mediaprovider4fuseL7pf_openEP8fuse_reqmP14fuse_file_info",
+                             (void*)WrappedPfOpen, &gOriginalPfOpen, "hook pf_open failed");
+    }
+    if (gOriginalPfOpendir == nullptr) {
+        InstallHookForSymbol("_ZN13mediaprovider4fuseL10pf_opendirEP8fuse_reqmP14fuse_file_info",
+                             (void*)WrappedPfOpendir, &gOriginalPfOpendir,
+                             "hook pf_opendir failed");
+    }
+    if (gOriginalPfMkdir == nullptr) {
+        InstallHookForSymbol("_ZN13mediaprovider4fuseL8pf_mkdirEP8fuse_reqmPKcj",
+                             (void*)WrappedPfMkdir, &gOriginalPfMkdir, "hook pf_mkdir failed");
+    }
+    if (gOriginalPfMknod == nullptr) {
+        InstallHookForSymbol("_ZN13mediaprovider4fuseL8pf_mknodEP8fuse_reqmPKcjm",
+                             (void*)WrappedPfMknod, &gOriginalPfMknod, "hook pf_mknod failed");
+    }
+    if (gOriginalPfUnlink == nullptr) {
+        InstallHookForSymbol("_ZN13mediaprovider4fuseL9pf_unlinkEP8fuse_reqmPKc",
+                             (void*)WrappedPfUnlink, &gOriginalPfUnlink, "hook pf_unlink failed");
+    }
+    if (gOriginalPfRmdir == nullptr) {
+        InstallHookForSymbol("_ZN13mediaprovider4fuseL8pf_rmdirEP8fuse_reqmPKc",
+                             (void*)WrappedPfRmdir, &gOriginalPfRmdir, "hook pf_rmdir failed");
+    }
+    if (gOriginalPfCreate == nullptr) {
+        InstallHookForSymbol("_ZN13mediaprovider4fuseL9pf_createEP8fuse_reqmPKcjP14fuse_file_info",
+                             (void*)WrappedPfCreate, &gOriginalPfCreate, "hook pf_create failed");
     }
     if (gOriginalPfLookupPostfilter == nullptr) {
         InstallHookForSymbol(
@@ -2597,6 +3867,11 @@ void InstallAdvancedDebugHooks(const ModuleInfo& module) {
             "entry_bpf_out",
             (void*)WrappedPfLookupPostfilter, &gOriginalPfLookupPostfilter,
             "hook pf_lookup_postfilter failed");
+    }
+    if (gOriginalPfGetattr == nullptr) {
+        InstallHookForSymbol("_ZN13mediaprovider4fuseL10pf_getattrEP8fuse_reqmP14fuse_file_info",
+                             (void*)WrappedPfGetattr, &gOriginalPfGetattr,
+                             "hook pf_getattr failed");
     }
 }
 
@@ -2666,6 +3941,11 @@ extern "C" void PostNativeInit(const char* loadedLibrary, void*) {
 
 extern "C" {
 
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    gJavaVm = vm;
+    return JNI_VERSION_1_6;
+}
+
 JNIEXPORT jint JNICALL Java_io_github_xiaotong6666_fusefixer_Utils_rmdir(JNIEnv* env, jclass clazz,
                                                                          jstring path) {
     (void)clazz;
@@ -2690,6 +3970,53 @@ JNIEXPORT jint JNICALL Java_io_github_xiaotong6666_fusefixer_Utils_unlink(JNIEnv
         ret = errno;
     else
         ret = 0;
+    env->ReleaseStringUTFChars(path, c_path);
+    return ret;
+}
+
+JNIEXPORT jint JNICALL Java_io_github_xiaotong6666_fusefixer_Utils_mkdir(JNIEnv* env, jclass clazz,
+                                                                         jstring path) {
+    (void)clazz;
+    const char* c_path = env->GetStringUTFChars(path, nullptr);
+
+    jint ret = mkdir(c_path, 0777);
+    if (ret != 0)
+        ret = errno;
+    else
+        ret = 0;
+    env->ReleaseStringUTFChars(path, c_path);
+    return ret;
+}
+
+JNIEXPORT jint JNICALL Java_io_github_xiaotong6666_fusefixer_Utils_rename(JNIEnv* env, jclass clazz,
+                                                                          jstring old_path,
+                                                                          jstring new_path) {
+    (void)clazz;
+    const char* c_old_path = env->GetStringUTFChars(old_path, nullptr);
+    const char* c_new_path = env->GetStringUTFChars(new_path, nullptr);
+
+    jint ret = rename(c_old_path, c_new_path);
+    if (ret != 0)
+        ret = errno;
+    else
+        ret = 0;
+    env->ReleaseStringUTFChars(old_path, c_old_path);
+    env->ReleaseStringUTFChars(new_path, c_new_path);
+    return ret;
+}
+
+JNIEXPORT jint JNICALL Java_io_github_xiaotong6666_fusefixer_Utils_create(JNIEnv* env, jclass clazz,
+                                                                          jstring path) {
+    (void)clazz;
+    const char* c_path = env->GetStringUTFChars(path, nullptr);
+
+    const int fd = open(c_path, O_CREAT | O_EXCL | O_CLOEXEC | O_RDWR, 0666);
+    jint ret = 0;
+    if (fd < 0) {
+        ret = errno;
+    } else {
+        close(fd);
+    }
     env->ReleaseStringUTFChars(path, c_path);
     return ret;
 }

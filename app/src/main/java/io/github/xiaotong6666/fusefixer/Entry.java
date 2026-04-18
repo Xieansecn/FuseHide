@@ -2,11 +2,13 @@ package io.github.xiaotong6666.fusefixer;
 
 import android.app.AndroidAppHelper;
 import android.app.Application;
+import android.content.Context;
 import android.content.IntentFilter;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import androidx.core.content.ContextCompat;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 import fusefixer.MainThreadTask;
@@ -23,7 +25,7 @@ public class Entry implements IXposedHookLoadPackage {
         if (PACKAGE_MEDIA.equals(loadPackageParam.packageName)
                 || PACKAGE_MEDIA_GOOGLE.equals(loadPackageParam.packageName)) {
             System.loadLibrary("fusefixer");
-            Log.d("LSPosedFuseFixer", "injected");
+            Log.d("FuseFixer", "injected");
             new Handler(Looper.getMainLooper()).post(new MainThreadTask(0, this));
         }
     }
@@ -32,19 +34,19 @@ public class Entry implements IXposedHookLoadPackage {
         try {
             Application application = AndroidAppHelper.currentApplication();
             if (application == null) {
-                Log.e("LSPosedFuseFixer", "app is null??");
+                Log.e("FuseFixer", "app is null??");
                 return;
             }
             StatusBroadcastReceiver receiver = new StatusBroadcastReceiver(application, 0);
             IntentFilter filter = new IntentFilter(ACTION_GET_STATUS);
             if (Build.VERSION.SDK_INT >= 33) {
-                application.registerReceiver(receiver, filter, 2);
+                application.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
             } else {
-                application.registerReceiver(receiver, filter);
+                ContextCompat.registerReceiver(application, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
             }
-            Log.d("LSPosedFuseFixer", "registered");
+            Log.d("FuseFixer", "registered");
         } catch (Throwable th) {
-            Log.e("LSPosedFuseFixer", "register", th);
+            Log.e("FuseFixer", "register", th);
         }
     }
 }

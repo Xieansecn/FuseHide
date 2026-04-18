@@ -315,38 +315,29 @@ class MainActivity : ComponentActivity() {
                     appendOutput("GetCon $displayPath -> OK\n$selinuxContext\n")
                 }
                 5 -> {
-                    try {
-                        if (File(rawPath).createNewFile()) {
-                            appendOutput("Create $displayPath -> OK\n")
-                        } else {
-                            appendOutput("Create $displayPath -> Failed (file already exists)\n")
-                        }
-                    } catch (e: Exception) {
-                        appendOutput("Create $displayPath -> ${e.message}\n")
+                    val res = Utils.create(rawPath)
+                    if (res == 0) {
+                        appendOutput("Create $displayPath -> OK\n")
+                    } else {
+                        appendOutput("Create $displayPath -> ${OsConstants.errnoName(res)}\n")
                     }
                 }
                 6 -> {
-                    try {
-                        if (File(rawPath).mkdirs()) {
-                            appendOutput("Mkdir $displayPath -> OK\n")
-                        } else {
-                            appendOutput("Mkdir $displayPath -> Failed (dir already exists or permission denied)\n")
-                        }
-                    } catch (e: Exception) {
-                        appendOutput("Mkdir $displayPath -> ${e.message}\n")
+                    val res = Utils.mkdir(rawPath)
+                    if (res == 0) {
+                        appendOutput("Mkdir $displayPath -> OK\n")
+                    } else {
+                        appendOutput("Mkdir $displayPath -> ${OsConstants.errnoName(res)}\n")
                     }
                 }
                 7 -> {
                     val rawPath2 = unescapeUnicodeLiterals(pathText2) ?: return
                     val displayPath2 = escapeNonAscii(rawPath2)
-                    try {
-                        if (File(rawPath).renameTo(File(rawPath2))) {
-                            appendOutput("Move $displayPath -> $displayPath2 -> OK\n")
-                        } else {
-                            appendOutput("Move $displayPath -> $displayPath2 -> Failed\n")
-                        }
-                    } catch (e: Exception) {
-                        appendOutput("Move $displayPath -> $displayPath2 -> ${e.message}\n")
+                    val res = Utils.rename(rawPath, rawPath2)
+                    if (res == 0) {
+                        appendOutput("Move $displayPath -> $displayPath2 -> OK\n")
+                    } else {
+                        appendOutput("Move $displayPath -> $displayPath2 -> ${OsConstants.errnoName(res)}\n")
                     }
                 }
                 8 -> {

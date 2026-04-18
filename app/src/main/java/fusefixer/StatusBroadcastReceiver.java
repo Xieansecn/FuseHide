@@ -34,14 +34,14 @@ public final class StatusBroadcastReceiver extends BroadcastReceiver {
 
     private void handleGetStatus(Intent intent) {
         try {
-            Log.d("LSPosedFuseFixer", "recv " + intent);
+            Log.d("FuseFixer", "recv " + intent);
             PendingIntent pendingIntent = intent.getParcelableExtra("EXTRA_PENDING_INTENT");
             if (pendingIntent == null) {
-                Log.e("LSPosedFuseFixer", "no pendingintent?");
+                Log.e("FuseFixer", "no pendingintent?");
                 return;
             }
             if (!APP_PACKAGE.equals(pendingIntent.getCreatorPackage())) {
-                Log.e("LSPosedFuseFixer", "invalid pkg " + pendingIntent.getCreatorPackage());
+                Log.e("FuseFixer", "invalid pkg " + pendingIntent.getCreatorPackage());
                 return;
             }
 
@@ -62,10 +62,10 @@ public final class StatusBroadcastReceiver extends BroadcastReceiver {
     private void handleSetStatus(Intent intent) {
         MainActivity mainActivity = (MainActivity) owner;
         try {
-            Log.d("LSPosedFuseFixer", "recv status " + intent);
+            Log.d("FuseFixer", "recv status " + intent);
             PendingIntent pendingIntent = intent.getParcelableExtra("EXTRA_PENDING_INTENT");
             if (pendingIntent == null) {
-                Log.e("LSPosedFuseFixer", "status pendingintent missing");
+                Log.e("FuseFixer", "status pendingintent missing");
                 return;
             }
             String creatorPackage = pendingIntent.getCreatorPackage();
