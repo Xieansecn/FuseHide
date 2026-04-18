@@ -166,9 +166,10 @@ using GetDirectoryEntriesFn = DirectoryEntries (*)(void* wrapper, uint32_t uid,
                                                    const std::string& path, DIR* dirp);
 
 // These RVAs are device-specific addresses from the reverse-engineered libfuse_jni.so.
-// InstallMinimalDebugHooks() and InstallAdvancedDebugHooks() use them only as a fallback when the
-// safer imported-symbol path is missing or the device build routes execution through internal
-// functions that are not exposed by name.
+// The production device library we analyzed is stripped, so internal helpers such as
+// is_app_accessible_path and several pf_* handlers are not always recoverable by name from the
+// shipped ELF. Keep these offsets only as a last resort for this exact build when symbol-based
+// resolution fails.
 // Reverse-engineered record: is_app_accessible_path @ 0x0017bb5c.
 constexpr uintptr_t kDeviceIsAppAccessiblePathOffset = 0x0017bb5c;
 // Reverse-engineered record: pf_lookup @ 0x00175e48.
@@ -3724,6 +3725,11 @@ void InstallMinimalCoreHooks(const ModuleInfo& module, const FileElfContext& fil
 
     if (gOriginalIsAppAccessiblePath == nullptr) {
         // Reverse-engineered record: is_app_accessible_path @ 0x0017bb5c.
+        // This is the shared access-policy gate reached by lookup/readdir/getattr and by several
+        // inode-based handlers such as access/open/opendir. Those paths do not all have their own
+        // dedicated wrappers, so leaving this unresolved would weaken hidden-path coverage on the
+        // stripped production binary. Only use the device RVA after the name-based attempts above
+        // have already failed.
         TryInstallInlineHookAt(
             reinterpret_cast<void*>(module.base + kDeviceIsAppAccessiblePathOffset),
             reinterpret_cast<void*>(+WrappedIsAppAccessiblePath),
@@ -3973,6 +3979,9 @@ void InstallAdvancedCoreHooks(const ModuleInfo& module, CoreHookStatus* status) 
 
     if (gOriginalIsAppAccessiblePath == nullptr) {
         // Reverse-engineered record: is_app_accessible_path @ 0x0017bb5c.
+        // Repeat the same last-resort fallback here because the advanced path runs when the
+        // initial file-backed install was unavailable or still failed to resolve this stripped
+        // internal helper by name.
         TryInstallInlineHookAt(
             reinterpret_cast<void*>(module.base + kDeviceIsAppAccessiblePathOffset),
             reinterpret_cast<void*>(+WrappedIsAppAccessiblePath),
