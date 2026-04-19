@@ -6,6 +6,12 @@ add_library(
     fusefixer
     SHARED
     fusefixer.cpp
+    fusefixer/unicode_policy.cpp
+    fusefixer/runtime_state.cpp
+    fusefixer/fuse_wrappers.cpp
+    fusefixer/elf_utils.cpp
+    fusefixer/hook_install.cpp
+    fusefixer/jni_entry.cpp
     third_party/xz-embedded/xz_dec_stream.c
     third_party/xz-embedded/xz_dec_lzma2.c
     third_party/xz-embedded/xz_crc32.c
