@@ -31,7 +31,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.wrapContentHeight
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
@@ -761,7 +760,6 @@ private fun fuseFixerHomeScreen(
     onCopyAllClick: () -> Unit,
     onSelfDataClick: () -> Unit,
 ) {
-    val tabListState = rememberLazyListState()
     val pagerState = rememberPagerState(initialPage = selectedTab, pageCount = { 2 })
     val coroutineScope = rememberCoroutineScope()
 
@@ -801,7 +799,6 @@ private fun fuseFixerHomeScreen(
                             onTabSelected(it)
                             coroutineScope.launch { pagerState.animateScrollToPage(it) }
                         },
-                        listState = tabListState,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                     )
                 },
