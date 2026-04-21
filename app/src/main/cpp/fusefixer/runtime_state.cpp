@@ -109,6 +109,7 @@ std::mutex gUidErrRemapMutex;
 struct UidErrRemapState {
     int baselineErr = 0;
     std::chrono::steady_clock::time_point expiresAt{};
+    uint32_t pendingCount = 0;
 };
 
 std::unordered_map<uint32_t, UidErrRemapState> gUidErrRemapStates;
@@ -331,11 +332,11 @@ void ArmHiddenErrorRemap(fuse_req_t req, int err, const char* opName) {
     gPendingHiddenErrno = err;
     const uint32_t uid = RuntimeState::ReqUid(req);
     if (uid != 0) {
-        UidErrRemapState state;
+        std::lock_guard<std::mutex> lock(gUidErrRemapMutex);
+        UidErrRemapState& state = gUidErrRemapStates[uid];
         state.baselineErr = err;
         state.expiresAt = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        std::lock_guard<std::mutex> lock(gUidErrRemapMutex);
-        gUidErrRemapStates[uid] = state;
+        state.pendingCount = std::min<uint32_t>(state.pendingCount + 1, 8);
     }
     DebugLogPrint(4, "%s arm hidden errno remap req=%p unique=%lu baseline=%d", opName, req,
                   req ? (unsigned long)req->unique : 0UL, err);
@@ -349,31 +350,31 @@ void ArmHiddenCreateLeakRemap(fuse_req_t req, const char* opName) {
     if (uid == 0 || !HiddenPathPolicy::IsTestHiddenUid(uid)) {
         return;
     }
-    UidErrRemapState state;
+    std::lock_guard<std::mutex> lock(gUidErrRemapMutex);
+    UidErrRemapState& state = gUidErrRemapStates[uid];
     state.baselineErr = EPERM;
     state.expiresAt = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    std::lock_guard<std::mutex> lock(gUidErrRemapMutex);
-    gUidErrRemapStates[uid] = state;
+    state.pendingCount = std::min<uint32_t>(state.pendingCount + 1, 8);
     DebugLogPrint(4, "%s arm create leak remap uid=%u baseline=%d", opName,
                   static_cast<unsigned>(uid), EPERM);
 }
 
 int MaybeRewriteHiddenLeakErrno(fuse_req_t req, int err, const char* caller) {
-    if (req == nullptr || gPendingHiddenErrReq != req ||
-        gPendingHiddenErrReqUnique != req->unique || gPendingHiddenErrno <= 0) {
+    if (req != nullptr && gPendingHiddenErrReq == req &&
+        gPendingHiddenErrReqUnique == req->unique && gPendingHiddenErrno > 0 && err > 0 &&
+        IsExistenceLeakErrno(err)) {
+        const int baselineErr = gPendingHiddenErrno;
+        gPendingHiddenErrReq = nullptr;
+        gPendingHiddenErrReqUnique = 0;
+        gPendingHiddenErrno = 0;
+
+        if (err != baselineErr) {
+            DebugLogPrint(4, "%s remap leaked errno req=%p unique=%lu from=%d to=%d", caller, req,
+                          (unsigned long)req->unique, err, baselineErr);
+            LogErrnoRemapEvent("req", req, RuntimeState::ReqUid(req), err, baselineErr);
+            return baselineErr;
+        }
         return err;
-    }
-
-    const int baselineErr = gPendingHiddenErrno;
-    gPendingHiddenErrReq = nullptr;
-    gPendingHiddenErrReqUnique = 0;
-    gPendingHiddenErrno = 0;
-
-    if (err > 0 && IsExistenceLeakErrno(err) && err != baselineErr) {
-        DebugLogPrint(4, "%s remap leaked errno req=%p unique=%lu from=%d to=%d", caller, req,
-                      (unsigned long)req->unique, err, baselineErr);
-        LogErrnoRemapEvent("req", req, RuntimeState::ReqUid(req), err, baselineErr);
-        return baselineErr;
     }
 
     if (req == nullptr || err <= 0 || !IsExistenceLeakErrno(err)) {
@@ -391,10 +392,14 @@ int MaybeRewriteHiddenLeakErrno(fuse_req_t req, int err, const char* caller) {
         const auto it = gUidErrRemapStates.find(uid);
         if (it != gUidErrRemapStates.end()) {
             if (it->second.expiresAt >= std::chrono::steady_clock::now() &&
-                it->second.baselineErr > 0) {
+                it->second.baselineErr > 0 && it->second.pendingCount > 0) {
                 uidBaselineErr = it->second.baselineErr;
+                it->second.pendingCount--;
             }
-            gUidErrRemapStates.erase(it);
+            if (it->second.pendingCount == 0 ||
+                it->second.expiresAt < std::chrono::steady_clock::now()) {
+                gUidErrRemapStates.erase(it);
+            }
         }
     }
 
