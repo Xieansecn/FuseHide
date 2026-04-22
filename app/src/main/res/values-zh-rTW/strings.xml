@@ -68,8 +68,8 @@
     <string name="field_hide_all_desc">啟用後，/storage/emulated/0 下的每個第一層目錄都會被隱藏，但下列例外項目仍會顯示。</string>
     <string name="field_visible_exemptions">可見例外</string>
     <string name="field_visible_exemptions_help">每行一個路徑。除非你很清楚自己在做什麼，否則請保留 Android 可見。</string>
-    <string name="field_hidden_root_names">隱藏目標</string>
-    <string name="field_hidden_root_names_help">每行一個路徑。</string>
+    <string name="field_hidden_targets">隱藏目標</string>
+    <string name="field_hidden_targets_help">每行一個路徑。</string>
     <string name="field_hidden_package_names">隱藏的套件名稱</string>
     <string name="field_hidden_package_names_help">每行一個套件名稱。</string>
     <string name="field_primary_path_help">供 Stat、Access、List、Open、Create、Mkdir 和 Unlink 使用。</string>

@@ -13,6 +13,8 @@ public final class HideConfigNativeBridge {
 
     public static native String[] getDefaultHiddenRootEntryNames();
 
+    public static native String[] getDefaultHiddenRelativePaths();
+
     public static native String[] getDefaultHiddenPackages();
 
     public static native boolean getCurrentEnableHideAllRootEntries();
@@ -21,11 +23,14 @@ public final class HideConfigNativeBridge {
 
     public static native String[] getCurrentHiddenRootEntryNames();
 
+    public static native String[] getCurrentHiddenRelativePaths();
+
     public static native String[] getCurrentHiddenPackages();
 
     public static native void applyHideConfig(
             boolean enableHideAllRootEntries,
             String[] hideAllRootEntriesExemptions,
             String[] hiddenRootEntryNames,
+            String[] hiddenRelativePaths,
             String[] hiddenPackages);
 }

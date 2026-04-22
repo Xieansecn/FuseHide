@@ -35,6 +35,9 @@ HideConfig DefaultHideConfig() {
     for (const auto& value : kHiddenRootEntryNames) {
         config.hiddenRootEntryNames.emplace_back(value);
     }
+    for (const auto& value : kHiddenRelativePaths) {
+        config.hiddenRelativePaths.emplace_back(value);
+    }
     for (const auto& value : kHiddenPackages) {
         config.hiddenPackages.emplace_back(value);
     }

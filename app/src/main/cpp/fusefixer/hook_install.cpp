@@ -300,6 +300,9 @@ std::optional<FileElfContext> BuildFileElfContext(const ModuleInfo& module) {
 bool TryInstallInlineHookAt(void* target, void* replacement, void** backup,
                             const char* failureMessage) {
     if (backup != nullptr && *backup != nullptr) {
+        __android_log_print(4, kLogTag,
+                            "hook already installed %s target=%p replacement=%p backup=%p",
+                            failureMessage, target, replacement, *backup);
         return true;
     }
     if (gHookInstaller == nullptr) {
@@ -311,8 +314,8 @@ bool TryInstallInlineHookAt(void* target, void* replacement, void** backup,
         __android_log_print(6, kLogTag, "%s: %d", failureMessage, status);
         return false;
     }
-    __android_log_print(4, kLogTag, "inline hook ok target=%p backup=%p", target,
-                        backup != nullptr ? *backup : nullptr);
+    __android_log_print(4, kLogTag, "hook installed %s target=%p replacement=%p backup=%p",
+                        failureMessage, target, replacement, backup != nullptr ? *backup : nullptr);
     return true;
 }
 
@@ -505,6 +508,10 @@ void InstallMinimalDebugHooks(const ModuleInfo& module, const FileElfContext& fi
                                    &gOriginalLstat, "lstat");
     InstallFileCompareHookIfNeeded(fileContext.elfInfo, "stat", "stat", (void*)WrappedStat,
                                    &gOriginalStat, "stat");
+    InstallFileCompareHookIfNeeded(fileContext.elfInfo, "getxattr", "getxattr",
+                                   (void*)WrappedGetxattr, &gOriginalGetxattr, "getxattr");
+    InstallFileCompareHookIfNeeded(fileContext.elfInfo, "lgetxattr", "lgetxattr",
+                                   (void*)WrappedLgetxattr, &gOriginalLgetxattr, "lgetxattr");
     InstallFileCompareHookIfNeeded(fileContext.elfInfo, "mkdir", "mkdir", (void*)WrappedMkdirLibc,
                                    &gOriginalMkdir, "mkdir");
     InstallFileCompareHookIfNeeded(fileContext.elfInfo, "mknod", "mknod", (void*)WrappedMknod,
@@ -514,13 +521,33 @@ void InstallMinimalDebugHooks(const ModuleInfo& module, const FileElfContext& fi
     InstallFileCompareHookIfNeeded(fileContext.elfInfo, "__open_2", "__open_2", (void*)WrappedOpen2,
                                    &gOriginalOpen2, "__open_2");
     if (gOriginalGetDirectoryEntries == nullptr) {
-        // Reverse-engineered record: MediaProviderWrapper::GetDirectoryEntries @ 0x0018a3ec.
-        // This wrapper is a C++ member function and is not always reachable through imported symbol
-        // tables on the device build, so keep the direct RVA fallback.
+        // Reverse-engineered record: MediaProviderWrapper::GetDirectoryEntries thunk @ 0x001fd6b0.
+        // do_readdir_common reaches the member function through this thunk on the analyzed device
+        // build, so hooking only the concrete body is insufficient for enumeration
+        // tracing/filtering.
         TryInstallInlineHookAt(
             reinterpret_cast<void*>(module.base + kDeviceGetDirectoryEntriesOffset),
             (void*)WrappedGetDirectoryEntries, &gOriginalGetDirectoryEntries,
             "hook GetDirectoryEntries failed");
+    }
+    if (gOriginalAddDirectoryEntriesFromLowerFs == nullptr) {
+        // Reverse-engineered record: addDirectoryEntriesFromLowerFs body @ 0x0018be00.
+        TryInstallInlineHookAt(
+            reinterpret_cast<void*>(module.base + kDeviceAddDirectoryEntriesFromLowerFsOffset),
+            (void*)WrappedAddDirectoryEntriesFromLowerFs, &gOriginalAddDirectoryEntriesFromLowerFs,
+            "hook addDirectoryEntriesFromLowerFs failed");
+    }
+    if (gOriginalAddDirectoryEntriesFromLowerFs == nullptr) {
+        TryInstallInlineHookAt(
+            reinterpret_cast<void*>(module.base + kDeviceAddDirectoryEntriesFromLowerFsThunkOffset),
+            (void*)WrappedAddDirectoryEntriesFromLowerFs, &gOriginalAddDirectoryEntriesFromLowerFs,
+            "hook addDirectoryEntriesFromLowerFs thunk failed");
+    }
+    if (gOriginalDoReaddirCommon == nullptr) {
+        // Reverse-engineered record: do_readdir_common @ 0x0018036c.
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDeviceDoReaddirCommonOffset),
+                               (void*)WrappedDoReaddirCommon, &gOriginalDoReaddirCommon,
+                               "hook do_readdir_common failed");
     }
     if (gOriginalPfMkdir == nullptr) {
         // Reverse-engineered record: pf_mkdir @ 0x00177050.
@@ -768,6 +795,12 @@ void InstallAdvancedDebugHooks(const ModuleInfo& module) {
                                         (void*)WrappedLstat, &gOriginalLstat, "lstat");
             PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "stat", "stat",
                                         (void*)WrappedStat, &gOriginalStat, "stat");
+            PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "getxattr",
+                                        "getxattr", (void*)WrappedGetxattr, &gOriginalGetxattr,
+                                        "getxattr");
+            PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "lgetxattr",
+                                        "lgetxattr", (void*)WrappedLgetxattr, &gOriginalLgetxattr,
+                                        "lgetxattr");
             PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "mkdir", "mkdir",
                                         (void*)WrappedMkdirLibc, &gOriginalMkdir, "mkdir");
             PatchRuntimeRelocationSlots(*runtimeDyn, module.base, getpagesize(), "mknod", "mknod",
@@ -783,13 +816,30 @@ void InstallAdvancedDebugHooks(const ModuleInfo& module) {
     }
 
     if (gOriginalGetDirectoryEntries == nullptr) {
-        // Reverse-engineered record: MediaProviderWrapper::GetDirectoryEntries @ 0x0018a3ec.
-        // Keep the RVA fallback even after runtime relocation patching because this member function
-        // is not guaranteed to participate in imported relocation slots.
+        // Reverse-engineered record: MediaProviderWrapper::GetDirectoryEntries thunk @ 0x001fd6b0.
         TryInstallInlineHookAt(
             reinterpret_cast<void*>(module.base + kDeviceGetDirectoryEntriesOffset),
             (void*)WrappedGetDirectoryEntries, &gOriginalGetDirectoryEntries,
             "hook GetDirectoryEntries failed");
+    }
+    if (gOriginalAddDirectoryEntriesFromLowerFs == nullptr) {
+        // Reverse-engineered record: addDirectoryEntriesFromLowerFs body @ 0x0018be00.
+        TryInstallInlineHookAt(
+            reinterpret_cast<void*>(module.base + kDeviceAddDirectoryEntriesFromLowerFsOffset),
+            (void*)WrappedAddDirectoryEntriesFromLowerFs, &gOriginalAddDirectoryEntriesFromLowerFs,
+            "hook addDirectoryEntriesFromLowerFs failed");
+    }
+    if (gOriginalAddDirectoryEntriesFromLowerFs == nullptr) {
+        TryInstallInlineHookAt(
+            reinterpret_cast<void*>(module.base + kDeviceAddDirectoryEntriesFromLowerFsThunkOffset),
+            (void*)WrappedAddDirectoryEntriesFromLowerFs, &gOriginalAddDirectoryEntriesFromLowerFs,
+            "hook addDirectoryEntriesFromLowerFs thunk failed");
+    }
+    if (gOriginalDoReaddirCommon == nullptr) {
+        // Reverse-engineered record: do_readdir_common @ 0x0018036c.
+        TryInstallInlineHookAt(reinterpret_cast<void*>(module.base + kDeviceDoReaddirCommonOffset),
+                               (void*)WrappedDoReaddirCommon, &gOriginalDoReaddirCommon,
+                               "hook do_readdir_common failed");
     }
     if (gOriginalPfMkdir == nullptr) {
         // Reverse-engineered record: pf_mkdir @ 0x00177050.

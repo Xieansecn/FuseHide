@@ -68,8 +68,8 @@
     <string name="field_hide_all_desc">启用后，/storage/emulated/0 下的每个一级目录都将被隐藏，以下例外情况除外。</string>
     <string name="field_visible_exemptions">可见例外</string>
     <string name="field_visible_exemptions_help">每行一条路径。除非您明确知道您在干什么，否则请保持 Android 可见。</string>
-    <string name="field_hidden_root_names">隐藏目标</string>
-    <string name="field_hidden_root_names_help">每行一条路径。</string>
+    <string name="field_hidden_targets">隐藏目标</string>
+    <string name="field_hidden_targets_help">每行一条路径。</string>
     <string name="field_hidden_package_names">隐藏的包名</string>
     <string name="field_hidden_package_names_help">每行一个包名。</string>
     <string name="field_primary_path_help">供 stat、access、list、open、create、mkdir 和 unlink 使用。</string>

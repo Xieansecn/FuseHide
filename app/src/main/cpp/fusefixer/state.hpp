@@ -94,6 +94,7 @@ inline constexpr std::string_view kHiddenRootEntryNames[] = {
     "xinhao",
     "MT2",
 };
+inline constexpr std::string_view kHiddenRelativePaths[] = {};
 inline constexpr std::string_view kHiddenPackages[] = {
     "com.eltavine.duckdetector",
     "io.github.xiaotong6666.fusefixer",
@@ -120,11 +121,15 @@ using FuseReplyErrFn = int (*)(fuse_req_t, int);
 using DirectoryEntries = std::vector<std::shared_ptr<mediaprovider::fuse::DirectoryEntry>>;
 using GetDirectoryEntriesFn = DirectoryEntries (*)(void* wrapper, uint32_t uid,
                                                    const std::string& path, DIR* dirp);
+using LowerFsDirentFilterFn = bool (*)(const dirent& entry);
+using AddDirectoryEntriesFromLowerFsFn = void (*)(DIR* dirp, LowerFsDirentFilterFn filter,
+                                                  DirectoryEntries* entries);
 
 struct HideConfig {
     bool enableHideAllRootEntries = false;
     std::vector<std::string> hideAllRootEntriesExemptions;
     std::vector<std::string> hiddenRootEntryNames;
+    std::vector<std::string> hiddenRelativePaths;
     std::vector<std::string> hiddenPackages;
 };
 
@@ -143,8 +148,19 @@ inline constexpr uintptr_t kDevicePfLookupPostfilterOffset = 0x00175f90;
 inline constexpr uintptr_t kDevicePfGetattrOffset = 0x001762bc;
 // Reverse-engineered record: ShouldNotCache @ 0x0017dc64.
 inline constexpr uintptr_t kDeviceShouldNotCacheOffset = 0x0017dc64;
-// Reverse-engineered record: MediaProviderWrapper::GetDirectoryEntries @ 0x0018a3ec.
-inline constexpr uintptr_t kDeviceGetDirectoryEntriesOffset = 0x0018a3ec;
+// Reverse-engineered record: do_readdir_common @ 0x0018036c.
+// This is the shared enumeration core that builds the parent path, fetches directory entries,
+// and finally replies through fuse_reply_buf.
+inline constexpr uintptr_t kDeviceDoReaddirCommonOffset = 0x0018036c;
+// Reverse-engineered record: MediaProviderWrapper::GetDirectoryEntries thunk @ 0x001fd6b0.
+// do_readdir_common calls this thunk on the analyzed device build; hooking only the concrete body
+// at 0x0018a3ec is not sufficient when callers go through the thunk entry.
+inline constexpr uintptr_t kDeviceGetDirectoryEntriesOffset = 0x001fd6b0;
+// Reverse-engineered record: addDirectoryEntriesFromLowerFs body @ 0x0018be00.
+// GetDirectoryEntries() calls this body directly on the analyzed device build.
+inline constexpr uintptr_t kDeviceAddDirectoryEntriesFromLowerFsOffset = 0x0018be00;
+// External thunk/entry for the same helper on this build.
+inline constexpr uintptr_t kDeviceAddDirectoryEntriesFromLowerFsThunkOffset = 0x001fdcf8;
 // Reverse-engineered record: pf_mkdir @ 0x00177050.
 inline constexpr uintptr_t kDevicePfMkdirOffset = 0x00177050;
 // Reverse-engineered record: pf_mknod @ 0x00176ba8.
@@ -256,6 +272,7 @@ class RuntimeState final {
     static uint32_t ReqUid(fuse_req_t req);
     static void RememberFuseSession(fuse_req_t req);
     static void ScheduleHiddenEntryInvalidation();
+    static void ScheduleSpecificEntryInvalidation(uint64_t parent, std::string_view name);
     static void ScheduleHiddenInodeInvalidation(uint64_t ino);
 };
 
@@ -287,6 +304,7 @@ extern void* gOriginalPfCreate;
 extern void* gOriginalPfReaddir;
 extern void* gOriginalPfReaddirPostfilter;
 extern void* gOriginalPfReaddirplus;
+extern void* gOriginalDoReaddirCommon;
 extern void* gOriginalPfGetattr;
 extern void* gOriginalOpen;
 extern void* gOriginalOpen2;
@@ -294,6 +312,8 @@ extern void* gOriginalMkdir;
 extern void* gOriginalMknod;
 extern void* gOriginalLstat;
 extern void* gOriginalStat;
+extern void* gOriginalGetxattr;
+extern void* gOriginalLgetxattr;
 extern void* gOriginalShouldNotCache;
 extern void* gOriginalNotifyInvalEntry;
 extern void* gOriginalNotifyInvalInode;
@@ -302,6 +322,7 @@ extern void* gOriginalReplyEntry;
 extern void* gOriginalReplyBuf;
 extern void* gOriginalReplyErr;
 extern void* gOriginalGetDirectoryEntries;
+extern void* gOriginalAddDirectoryEntriesFromLowerFs;
 extern std::atomic<void*> gLastFuseSession;
 extern std::atomic<bool> gHiddenEntryInvalidationPending;
 extern std::atomic<uint64_t> gHiddenRootParentInode;
@@ -316,6 +337,7 @@ extern thread_local uint32_t gPfReaddirUid;
 extern thread_local uint64_t gPfGetattrIno;
 extern thread_local uint64_t gPfReaddirIno;
 extern thread_local uint64_t gCurrentLookupParentInode;
+extern thread_local std::string gCurrentLookupName;
 extern thread_local bool gTrackRootHiddenLookup;
 extern thread_local bool gTrackHiddenSubtreeLookup;
 extern thread_local bool gZeroAttrCacheForCurrentGetattr;
@@ -324,6 +346,19 @@ extern thread_local uint64_t gPendingHiddenErrReqUnique;
 extern thread_local int gPendingHiddenErrno;
 extern std::mutex gHiddenSubtreeInodesMutex;
 extern std::unordered_set<uint64_t> gHiddenSubtreeInodes;
+extern std::mutex gInodePathCacheMutex;
+extern std::unordered_map<uint64_t, std::string> gInodePathCache;
+struct PendingReaddirContext {
+    uint32_t uid = 0;
+    uint64_t ino = 0;
+    std::string path;
+};
+extern std::mutex gPendingReaddirContextsMutex;
+extern std::unordered_map<uint64_t, PendingReaddirContext> gPendingReaddirContexts;
+extern thread_local uint64_t gCurrentReaddirReqUnique;
+extern std::mutex gRecentHiddenParentPathsMutex;
+extern std::unordered_map<uint32_t, std::string> gRecentHiddenParentPaths;
+extern std::string gRecentHiddenParentPathAnyUid;
 
 namespace ReplyErrorBridge {
 // Use Original() only when preserving strict "hook backup only" semantics for a wrapper that
@@ -363,7 +398,10 @@ bool IsConfiguredHiddenRootEntryName(std::string_view name);
 bool IsHiddenRootEntryName(std::string_view name);
 bool IsAnyHiddenSubtreePath(std::string_view path);
 bool IsExactHiddenTargetPath(std::string_view path);
+std::optional<std::string> LookupTrackedPathForInode(uint64_t ino);
+void RememberTrackedPathForInode(uint64_t ino, std::string_view path);
 bool IsHiddenRootDirectoryPath(std::string_view path);
+bool IsParentOfExactHiddenTargetPath(std::string_view path);
 std::string JoinPathComponent(std::string_view parent, std::string_view child);
 size_t AlignDirentName(size_t nameLen);
 size_t FuseDirentRecordSize(const fuse_dirent* dirent);
@@ -373,10 +411,19 @@ bool ShouldFilterHiddenRootDirent(uint32_t uid, uint64_t ino, std::string_view n
 bool BuildFilteredDirentPayload(const char* data, size_t size, uint32_t uid, uint64_t ino,
                                 std::vector<char>* out, size_t* removedCount,
                                 bool requireParentMatch = true);
+bool BuildFilteredDirentPayloadForParentPath(const char* data, size_t size, uint32_t uid,
+                                             std::string_view parentPath, std::vector<char>* out,
+                                             size_t* removedCount);
 bool BuildFilteredDirentplusPayload(const char* data, size_t size, uint32_t uid, uint64_t ino,
                                     std::vector<char>* out, size_t* removedCount,
                                     bool requireParentMatch = true);
+bool BuildFilteredDirentplusPayloadForParentPath(const char* data, size_t size, uint32_t uid,
+                                                 std::string_view parentPath,
+                                                 std::vector<char>* out, size_t* removedCount);
 void NoteHiddenSubtreePathForCache(std::string_view path);
+void RememberRecentHiddenParentPath(uint32_t uid, std::string_view path);
+std::optional<std::string> LookupRecentHiddenParentPath(uint32_t uid);
+void ClearRecentHiddenParentPath(uint32_t uid);
 DirectoryEntries FilterHiddenDirectoryEntries(uint32_t uid, std::string_view parentPath,
                                               DirectoryEntries entries);
 DirectoryEntries WrappedGetDirectoryEntries(void* wrapper, uint32_t uid, const std::string& path,

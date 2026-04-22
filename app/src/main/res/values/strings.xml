@@ -68,8 +68,8 @@
     <string name="field_hide_all_desc">When enabled, every first-level directory under /storage/emulated/0 is hidden except for the visible exemptions below.</string>
     <string name="field_visible_exemptions">Visible exemptions</string>
     <string name="field_visible_exemptions_help">One path per line. Keep Android visible unless you know exactly what you are doing.</string>
-    <string name="field_hidden_root_names">Hidden targets</string>
-    <string name="field_hidden_root_names_help">One path per line.</string>
+    <string name="field_hidden_targets">Hidden targets</string>
+    <string name="field_hidden_targets_help">One path per line.</string>
     <string name="field_hidden_package_names">Hidden package names</string>
     <string name="field_hidden_package_names_help">One package name per line.</string>
     <string name="field_primary_path_help">Used by Stat, Access, List, Open, Create, Mkdir, and Unlink.</string>

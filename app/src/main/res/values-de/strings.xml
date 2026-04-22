@@ -68,8 +68,8 @@
     <string name="field_hide_all_desc">Wenn aktiviert, wird jedes Verzeichnis der ersten Ebene unter /storage/emulated/0 ausgeblendet, außer den unten aufgeführten sichtbaren Ausnahmen.</string>
     <string name="field_visible_exemptions">Sichtbare Ausnahmen</string>
     <string name="field_visible_exemptions_help">Ein Pfad pro Zeile. Lass Android sichtbar, sofern du nicht genau weißt, was du tust.</string>
-    <string name="field_hidden_root_names">Ausblendziele</string>
-    <string name="field_hidden_root_names_help">Ein Pfad pro Zeile.</string>
+    <string name="field_hidden_targets">Ausblendziele</string>
+    <string name="field_hidden_targets_help">Ein Pfad pro Zeile.</string>
     <string name="field_hidden_package_names">Ausgeblendete Paketnamen</string>
     <string name="field_hidden_package_names_help">Ein Paketname pro Zeile.</string>
     <string name="field_primary_path_help">Wird von Stat, Access, List, Open, Create, Mkdir und Unlink verwendet.</string>

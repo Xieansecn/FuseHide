@@ -27,6 +27,7 @@ public class Entry implements IXposedHookLoadPackage {
                 HideConfigNativeBridge.getCurrentEnableHideAllRootEntries(),
                 java.util.Arrays.asList(HideConfigNativeBridge.getCurrentHideAllRootEntriesExemptions()),
                 java.util.Arrays.asList(HideConfigNativeBridge.getCurrentHiddenRootEntryNames()),
+                java.util.Arrays.asList(HideConfigNativeBridge.getCurrentHiddenRelativePaths()),
                 java.util.Arrays.asList(HideConfigNativeBridge.getCurrentHiddenPackages()));
     }
 
@@ -76,6 +77,7 @@ public class Entry implements IXposedHookLoadPackage {
                                         config.getEnableHideAllRootEntries(),
                                         config.getHideAllRootEntriesExemptions().toArray(new String[0]),
                                         config.getHiddenRootEntryNames().toArray(new String[0]),
+                                        config.getHiddenRelativePaths().toArray(new String[0]),
                                         config.getHiddenPackages().toArray(new String[0]));
                                 applied = true;
                                 message = "hide config applied";

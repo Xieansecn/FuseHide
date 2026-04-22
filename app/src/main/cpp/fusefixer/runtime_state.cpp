@@ -17,6 +17,7 @@ void* gOriginalPfCreate = nullptr;
 void* gOriginalPfReaddir = nullptr;
 void* gOriginalPfReaddirPostfilter = nullptr;
 void* gOriginalPfReaddirplus = nullptr;
+void* gOriginalDoReaddirCommon = nullptr;
 void* gOriginalPfGetattr = nullptr;
 void* gOriginalOpen = nullptr;
 void* gOriginalOpen2 = nullptr;
@@ -24,6 +25,8 @@ void* gOriginalMkdir = nullptr;
 void* gOriginalMknod = nullptr;
 void* gOriginalLstat = nullptr;
 void* gOriginalStat = nullptr;
+void* gOriginalGetxattr = nullptr;
+void* gOriginalLgetxattr = nullptr;
 void* gOriginalShouldNotCache = nullptr;
 void* gOriginalNotifyInvalEntry = nullptr;
 void* gOriginalNotifyInvalInode = nullptr;
@@ -32,6 +35,7 @@ void* gOriginalReplyEntry = nullptr;
 void* gOriginalReplyBuf = nullptr;
 void* gOriginalReplyErr = nullptr;
 void* gOriginalGetDirectoryEntries = nullptr;
+void* gOriginalAddDirectoryEntriesFromLowerFs = nullptr;
 std::atomic<void*> gLastFuseSession{nullptr};
 std::atomic<bool> gHiddenEntryInvalidationPending{false};
 std::atomic<uint64_t> gHiddenRootParentInode{0};
@@ -46,12 +50,14 @@ thread_local uint32_t gPfReaddirUid = 0;
 thread_local uint64_t gPfGetattrIno = 0;
 thread_local uint64_t gPfReaddirIno = 0;
 thread_local uint64_t gCurrentLookupParentInode = 0;
+thread_local std::string gCurrentLookupName;
 thread_local bool gTrackRootHiddenLookup = false;
 thread_local bool gTrackHiddenSubtreeLookup = false;
 thread_local bool gZeroAttrCacheForCurrentGetattr = false;
 thread_local fuse_req_t gPendingHiddenErrReq = nullptr;
 thread_local uint64_t gPendingHiddenErrReqUnique = 0;
 thread_local int gPendingHiddenErrno = 0;
+thread_local uint64_t gCurrentReaddirReqUnique = 0;
 
 namespace ReplyErrorBridge {
 
@@ -104,6 +110,13 @@ std::optional<int> Reply(fuse_req_t req, int err, const char* caller) {
 
 std::mutex gHiddenSubtreeInodesMutex;
 std::unordered_set<uint64_t> gHiddenSubtreeInodes;
+std::mutex gInodePathCacheMutex;
+std::unordered_map<uint64_t, std::string> gInodePathCache;
+std::mutex gPendingReaddirContextsMutex;
+std::unordered_map<uint64_t, PendingReaddirContext> gPendingReaddirContexts;
+std::mutex gRecentHiddenParentPathsMutex;
+std::unordered_map<uint32_t, std::string> gRecentHiddenParentPaths;
+std::string gRecentHiddenParentPathAnyUid;
 std::mutex gUidErrRemapMutex;
 
 struct UidErrRemapState {
@@ -119,6 +132,69 @@ namespace {
 bool HasNonAsciiByte(std::string_view value) {
     for (unsigned char ch : value) {
         if ((ch & 0x80u) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string NormalizeRelativeHiddenPath(std::string_view path) {
+    size_t begin = 0;
+    size_t end = path.size();
+    while (begin < end && path[begin] == '/') {
+        begin++;
+    }
+    while (end > begin && path[end - 1] == '/') {
+        end--;
+    }
+    std::string normalized;
+    normalized.reserve(end - begin);
+    bool previousSlash = false;
+    for (size_t i = begin; i < end; ++i) {
+        const char ch = path[i];
+        if (ch == '/') {
+            if (previousSlash) {
+                continue;
+            }
+            previousSlash = true;
+        } else {
+            previousSlash = false;
+        }
+        normalized.push_back(ch);
+    }
+    return normalized;
+}
+
+std::optional<std::string> RelativePathForVisibleRoot(std::string_view path) {
+    for (const auto& root : kVisibleStorageRoots) {
+        if (path == root) {
+            return std::string();
+        }
+        if (path.size() > root.size() && path.compare(0, root.size(), root) == 0 &&
+            path[root.size()] == '/') {
+            return NormalizeRelativeHiddenPath(path.substr(root.size() + 1));
+        }
+    }
+    return std::nullopt;
+}
+
+bool MatchesRelativeHiddenPathList(std::string_view relativePath, bool exactOnly) {
+    const std::string normalized = NormalizeRelativeHiddenPath(relativePath);
+    if (normalized.empty()) {
+        return false;
+    }
+    const auto config = CurrentHideConfig();
+    for (const auto& configuredPath : config->hiddenRelativePaths) {
+        const std::string candidate = NormalizeRelativeHiddenPath(configuredPath);
+        if (candidate.empty()) {
+            continue;
+        }
+        if (normalized == candidate) {
+            return true;
+        }
+        if (!exactOnly && normalized.size() > candidate.size() &&
+            normalized.compare(0, candidate.size(), candidate) == 0 &&
+            normalized[candidate.size()] == '/') {
             return true;
         }
     }
@@ -218,6 +294,22 @@ void RuntimeState::ScheduleHiddenEntryInvalidation() {
     }).detach();
 }
 
+void RuntimeState::ScheduleSpecificEntryInvalidation(uint64_t parent, std::string_view name) {
+    auto notifyEntry =
+        reinterpret_cast<int (*)(void*, uint64_t, const char*, size_t)>(gOriginalNotifyInvalEntry);
+    void* session = gLastFuseSession.load(std::memory_order_relaxed);
+    if (notifyEntry == nullptr || session == nullptr || parent == 0 || name.empty()) {
+        return;
+    }
+    const std::string ownedName(name);
+    std::thread([notifyEntry, session, parent, ownedName]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        const int ret = notifyEntry(session, parent, ownedName.c_str(), ownedName.size());
+        DebugLogPrint(4, "scheduled specific entry invalidation parent=%s name=%s ret=%d",
+                      InodePath(parent).c_str(), DebugPreview(ownedName).c_str(), ret);
+    }).detach();
+}
+
 // Track subtree inodes so later getattr/readdir replies can also be forced uncached.
 void RuntimeState::ScheduleHiddenInodeInvalidation(uint64_t ino) {
     auto notifyInode =
@@ -264,6 +356,25 @@ bool IsHiddenLookupCacheTarget(uint64_t parent, const char* name) {
     return IsConfiguredHiddenRootEntryName(name) && (rootParent == 0 || parent == rootParent);
 }
 
+std::optional<HiddenNamedTargetKind> ClassifyHiddenNamedTargetByTrackedPath(uint64_t parent,
+                                                                            const char* name) {
+    if (name == nullptr) {
+        return std::nullopt;
+    }
+    const auto parentPath = LookupTrackedPathForInode(parent);
+    if (!parentPath.has_value()) {
+        return std::nullopt;
+    }
+    const std::string childPath = HiddenPathPolicy::JoinPathComponent(*parentPath, name);
+    if (HiddenPathPolicy::IsExactHiddenTargetPath(childPath)) {
+        return HiddenNamedTargetKind::Root;
+    }
+    if (HiddenPathPolicy::IsAnyHiddenSubtreePath(childPath)) {
+        return HiddenNamedTargetKind::Descendant;
+    }
+    return std::nullopt;
+}
+
 // Classify the current name-based operation as either the hidden root entry itself or a descendant
 // below a previously learned hidden subtree inode.
 HiddenNamedTargetKind ClassifyHiddenNamedTarget(uint32_t uid, uint64_t parent, const char* name) {
@@ -279,6 +390,10 @@ HiddenNamedTargetKind ClassifyHiddenNamedTarget(uint32_t uid, uint64_t parent, c
     }
     if (IsConfiguredHiddenRootEntryName(name) && (rootParent == 0 || parent == rootParent)) {
         return HiddenNamedTargetKind::Root;
+    }
+    if (const auto trackedPathKind = ClassifyHiddenNamedTargetByTrackedPath(parent, name);
+        trackedPathKind.has_value()) {
+        return *trackedPathKind;
     }
     return HiddenNamedTargetKind::None;
 }
@@ -449,6 +564,63 @@ bool RemoveTrackedHiddenSubtreeInode(uint64_t ino) {
     return gHiddenSubtreeInodes.erase(ino) != 0;
 }
 
+std::optional<std::string> LookupTrackedPathForInode(uint64_t ino) {
+    if (ino == 0) {
+        return std::nullopt;
+    }
+    const uint64_t rootParent = gHiddenRootParentInode.load(std::memory_order_relaxed);
+    if (rootParent != 0 && ino == rootParent) {
+        return std::string(kVisibleStorageRoots[0]);
+    }
+    std::lock_guard<std::mutex> lock(gInodePathCacheMutex);
+    const auto it = gInodePathCache.find(ino);
+    if (it == gInodePathCache.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+void RememberTrackedPathForInode(uint64_t ino, std::string_view path) {
+    if (ino == 0 || path.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(gInodePathCacheMutex);
+    gInodePathCache[ino] = std::string(path);
+}
+
+void RememberRecentHiddenParentPath(uint32_t uid, std::string_view path) {
+    if (path.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(gRecentHiddenParentPathsMutex);
+    gRecentHiddenParentPathAnyUid = std::string(path);
+    if (uid != 0) {
+        gRecentHiddenParentPaths[uid] = gRecentHiddenParentPathAnyUid;
+    }
+}
+
+std::optional<std::string> LookupRecentHiddenParentPath(uint32_t uid) {
+    std::lock_guard<std::mutex> lock(gRecentHiddenParentPathsMutex);
+    if (uid != 0) {
+        const auto it = gRecentHiddenParentPaths.find(uid);
+        if (it != gRecentHiddenParentPaths.end()) {
+            return it->second;
+        }
+    }
+    if (gRecentHiddenParentPathAnyUid.empty()) {
+        return std::nullopt;
+    }
+    return gRecentHiddenParentPathAnyUid;
+}
+
+void ClearRecentHiddenParentPath(uint32_t uid) {
+    std::lock_guard<std::mutex> lock(gRecentHiddenParentPathsMutex);
+    if (uid != 0) {
+        gRecentHiddenParentPaths.erase(uid);
+    }
+    gRecentHiddenParentPathAnyUid.clear();
+}
+
 bool HiddenPathPolicy::IsConfiguredHiddenRootEntryName(std::string_view name) {
     const auto config = CurrentHideConfig();
     for (const auto& rootEntryName : config->hiddenRootEntryNames) {
@@ -481,6 +653,10 @@ bool HiddenPathPolicy::IsHiddenRootEntryName(std::string_view name) {
 }
 
 bool HiddenPathPolicy::IsAnyHiddenSubtreePath(std::string_view path) {
+    if (const auto relativePath = RelativePathForVisibleRoot(path);
+        relativePath.has_value() && MatchesRelativeHiddenPathList(*relativePath, false)) {
+        return true;
+    }
     for (const auto& root : kVisibleStorageRoots) {
         if (path.size() <= root.size() || path.compare(0, root.size(), root) != 0 ||
             path[root.size()] != '/') {
@@ -504,6 +680,10 @@ bool HiddenPathPolicy::IsAnyHiddenSubtreePath(std::string_view path) {
 }
 
 bool HiddenPathPolicy::IsExactHiddenTargetPath(std::string_view path) {
+    if (const auto relativePath = RelativePathForVisibleRoot(path);
+        relativePath.has_value() && MatchesRelativeHiddenPathList(*relativePath, true)) {
+        return true;
+    }
     for (const auto& root : kVisibleStorageRoots) {
         if (path.size() <= root.size() || path.compare(0, root.size(), root) != 0 ||
             path[root.size()] != '/') {
@@ -527,6 +707,39 @@ bool HiddenPathPolicy::IsExactHiddenTargetPath(std::string_view path) {
 bool HiddenPathPolicy::IsHiddenRootDirectoryPath(std::string_view path) {
     for (const auto& root : kVisibleStorageRoots) {
         if (path == root) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsParentOfExactHiddenTargetPath(std::string_view path) {
+    // Root targets and nested relative targets need different list filtering keys. Root-level
+    // targets can be recognized by child name alone under /storage/emulated/0, but nested targets
+    // need the exact visible parent path so reply_buf can rebuild parentPath + childName.
+    for (const auto& root : kVisibleStorageRoots) {
+        if (path == root) {
+            const auto config = CurrentHideConfig();
+            return !config->hiddenRootEntryNames.empty() || config->enableHideAllRootEntries;
+        }
+    }
+
+    const auto relativePath = RelativePathForVisibleRoot(path);
+    if (!relativePath.has_value()) {
+        return false;
+    }
+
+    const auto config = CurrentHideConfig();
+    for (const auto& hiddenRelativePath : config->hiddenRelativePaths) {
+        const std::string normalized = NormalizeRelativeHiddenPath(hiddenRelativePath);
+        if (normalized.empty()) {
+            continue;
+        }
+        const size_t slash = normalized.rfind('/');
+        if (slash == std::string::npos) {
+            continue;
+        }
+        if (*relativePath == normalized.substr(0, slash)) {
             return true;
         }
     }
@@ -557,7 +770,18 @@ size_t FuseDirentplusRecordSize(const fuse_dirent* dirent) {
 bool HiddenPathPolicy::ShouldFilterHiddenRootDirent(uint32_t uid, uint64_t ino,
                                                     std::string_view name,
                                                     bool requireParentMatch) {
-    if (!IsTestHiddenUid(uid) || !IsHiddenRootEntryName(name)) {
+    if (!IsTestHiddenUid(uid)) {
+        return false;
+    }
+
+    if (const auto parentPath = LookupTrackedPathForInode(ino); parentPath.has_value()) {
+        const std::string childPath = JoinPathComponent(*parentPath, name);
+        if (IsExactHiddenTargetPath(childPath)) {
+            return true;
+        }
+    }
+
+    if (!IsHiddenRootEntryName(name)) {
         return false;
     }
     if (!requireParentMatch) {
@@ -565,6 +789,33 @@ bool HiddenPathPolicy::ShouldFilterHiddenRootDirent(uint32_t uid, uint64_t ino,
     }
     const uint64_t rootParent = gHiddenRootParentInode.load(std::memory_order_relaxed);
     return rootParent == 0 || ino == rootParent;
+}
+
+bool ShouldFilterTrackedHiddenDirentInode(uint32_t uid, uint64_t childIno, std::string_view name) {
+    if (!HiddenPathPolicy::IsTestHiddenUid(uid) || childIno == 0) {
+        return false;
+    }
+    if (!IsTrackedHiddenSubtreeInode(childIno)) {
+        return false;
+    }
+    DebugLogPrint(4, "filter dirent by tracked inode uid=%u child=%s name=%s",
+                  static_cast<unsigned>(uid), InodePath(childIno).c_str(),
+                  DebugPreview(name).c_str());
+    return true;
+}
+
+bool ShouldFilterDirentForParentPath(uint32_t uid, std::string_view parentPath, uint64_t childIno,
+                                     std::string_view name) {
+    if (!HiddenPathPolicy::IsTestHiddenUid(uid)) {
+        return false;
+    }
+    // Prefer exact inode matches when a hidden child inode is already known, then fall back to
+    // exact path matching for the recovered visible parent directory.
+    if (ShouldFilterTrackedHiddenDirentInode(uid, childIno, name)) {
+        return true;
+    }
+    const std::string childPath = HiddenPathPolicy::JoinPathComponent(parentPath, name);
+    return HiddenPathPolicy::IsExactHiddenTargetPath(childPath);
 }
 
 bool DirentFilter::BuildFilteredDirentPayload(const char* data, size_t size, uint32_t uid,
@@ -585,7 +836,41 @@ bool DirentFilter::BuildFilteredDirentPayload(const char* data, size_t size, uin
             return false;
         }
         const std::string_view name(dirent->name, dirent->namelen);
-        if (ShouldFilterHiddenRootDirent(uid, ino, name, requireParentMatch)) {
+        if (ShouldFilterTrackedHiddenDirentInode(uid, dirent->ino, name) ||
+            ShouldFilterHiddenRootDirent(uid, ino, name, requireParentMatch)) {
+            removed++;
+        } else {
+            out->insert(out->end(), data + offset, data + offset + recordSize);
+        }
+        offset += recordSize;
+    }
+    if (offset != size) {
+        return false;
+    }
+    *removedCount = removed;
+    return removed != 0;
+}
+
+bool BuildFilteredDirentPayloadForParentPath(const char* data, size_t size, uint32_t uid,
+                                             std::string_view parentPath, std::vector<char>* out,
+                                             size_t* removedCount) {
+    if (data == nullptr || size == 0 || out == nullptr || removedCount == nullptr ||
+        parentPath.empty()) {
+        return false;
+    }
+
+    out->clear();
+    out->reserve(size);
+    size_t offset = 0;
+    size_t removed = 0;
+    while (offset + offsetof(fuse_dirent, name) <= size) {
+        const auto* dirent = reinterpret_cast<const fuse_dirent*>(data + offset);
+        const size_t recordSize = FuseDirentRecordSize(dirent);
+        if (recordSize == 0 || offset + recordSize > size) {
+            return false;
+        }
+        const std::string_view name(dirent->name, dirent->namelen);
+        if (ShouldFilterDirentForParentPath(uid, parentPath, dirent->ino, name)) {
             removed++;
         } else {
             out->insert(out->end(), data + offset, data + offset + recordSize);
@@ -618,7 +903,42 @@ bool DirentFilter::BuildFilteredDirentplusPayload(const char* data, size_t size,
             return false;
         }
         const std::string_view name(dirent->name, dirent->namelen);
-        if (ShouldFilterHiddenRootDirent(uid, ino, name, requireParentMatch)) {
+        if (ShouldFilterTrackedHiddenDirentInode(uid, dirent->ino, name) ||
+            ShouldFilterHiddenRootDirent(uid, ino, name, requireParentMatch)) {
+            removed++;
+        } else {
+            out->insert(out->end(), data + offset, data + offset + recordSize);
+        }
+        offset += recordSize;
+    }
+    if (offset != size) {
+        return false;
+    }
+    *removedCount = removed;
+    return removed != 0;
+}
+
+bool BuildFilteredDirentplusPayloadForParentPath(const char* data, size_t size, uint32_t uid,
+                                                 std::string_view parentPath,
+                                                 std::vector<char>* out, size_t* removedCount) {
+    if (data == nullptr || size == 0 || out == nullptr || removedCount == nullptr ||
+        parentPath.empty()) {
+        return false;
+    }
+
+    out->clear();
+    out->reserve(size);
+    size_t offset = 0;
+    size_t removed = 0;
+    while (offset + kFuseEntryOutWireSize + offsetof(fuse_dirent, name) <= size) {
+        const auto* dirent =
+            reinterpret_cast<const fuse_dirent*>(data + offset + kFuseEntryOutWireSize);
+        const size_t recordSize = FuseDirentplusRecordSize(dirent);
+        if (recordSize == 0 || offset + recordSize > size) {
+            return false;
+        }
+        const std::string_view name(dirent->name, dirent->namelen);
+        if (ShouldFilterDirentForParentPath(uid, parentPath, dirent->ino, name)) {
             removed++;
         } else {
             out->insert(out->end(), data + offset, data + offset + recordSize);

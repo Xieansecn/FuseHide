@@ -23,6 +23,7 @@ object HideConfigStore {
     private const val KEY_ENABLE_HIDE_ALL_ROOT_ENTRIES = "enable_hide_all_root_entries"
     private const val KEY_HIDE_ALL_ROOT_ENTRIES_EXEMPTIONS = "hide_all_root_entries_exemptions"
     private const val KEY_HIDDEN_ROOT_ENTRY_NAMES = "hidden_root_entry_names"
+    private const val KEY_HIDDEN_RELATIVE_PATHS = "hidden_relative_paths"
     private const val KEY_HIDDEN_PACKAGES = "hidden_packages"
     private const val KEY_RELOAD_TOKEN = "reload_token"
 
@@ -48,6 +49,12 @@ object HideConfigStore {
                     encodeList(defaults.hiddenRootEntryNames),
                 ),
             ),
+            hiddenRelativePaths = parseStoredList(
+                prefs.getString(
+                    KEY_HIDDEN_RELATIVE_PATHS,
+                    encodeList(defaults.hiddenRelativePaths),
+                ),
+            ),
             hiddenPackages = parseStoredList(
                 prefs.getString(
                     KEY_HIDDEN_PACKAGES,
@@ -70,6 +77,7 @@ object HideConfigStore {
                 encodeList(config.hideAllRootEntriesExemptions),
             )
             .putString(KEY_HIDDEN_ROOT_ENTRY_NAMES, encodeList(config.hiddenRootEntryNames))
+            .putString(KEY_HIDDEN_RELATIVE_PATHS, encodeList(config.hiddenRelativePaths))
             .putString(KEY_HIDDEN_PACKAGES, encodeList(config.hiddenPackages))
             .putString(KEY_RELOAD_TOKEN, reloadToken)
             .apply()
@@ -83,6 +91,7 @@ object HideConfigStore {
             config.hideAllRootEntriesExemptions.toTypedArray(),
         )
         putStringArray(KEY_HIDDEN_ROOT_ENTRY_NAMES, config.hiddenRootEntryNames.toTypedArray())
+        putStringArray(KEY_HIDDEN_RELATIVE_PATHS, config.hiddenRelativePaths.toTypedArray())
         putStringArray(KEY_HIDDEN_PACKAGES, config.hiddenPackages.toTypedArray())
     }
 
@@ -94,6 +103,7 @@ object HideConfigStore {
             hideAllRootEntriesExemptions =
             bundle.getStringArray(KEY_HIDE_ALL_ROOT_ENTRIES_EXEMPTIONS)?.toList().orEmpty(),
             hiddenRootEntryNames = bundle.getStringArray(KEY_HIDDEN_ROOT_ENTRY_NAMES)?.toList().orEmpty(),
+            hiddenRelativePaths = bundle.getStringArray(KEY_HIDDEN_RELATIVE_PATHS)?.toList().orEmpty(),
             hiddenPackages = bundle.getStringArray(KEY_HIDDEN_PACKAGES)?.toList().orEmpty(),
         )
     }
@@ -120,6 +130,7 @@ object HideConfigStore {
                 config.enableHideAllRootEntries,
                 config.hideAllRootEntriesExemptions.toTypedArray(),
                 config.hiddenRootEntryNames.toTypedArray(),
+                config.hiddenRelativePaths.toTypedArray(),
                 config.hiddenPackages.toTypedArray(),
             )
             true

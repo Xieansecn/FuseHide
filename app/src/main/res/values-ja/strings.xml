@@ -68,8 +68,8 @@
     <string name="field_hide_all_desc">有効にすると、/storage/emulated/0 配下の第一階層ディレクトリは、以下の例外を除いてすべて隠されます。</string>
     <string name="field_visible_exemptions">表示例外</string>
     <string name="field_visible_exemptions_help">1 行に 1 つのパスを指定します。明確な理由がない限り、Android は表示したままにしてください。</string>
-    <string name="field_hidden_root_names">隠す対象</string>
-    <string name="field_hidden_root_names_help">1 行に 1 つのパスを指定します。</string>
+    <string name="field_hidden_targets">隠す対象</string>
+    <string name="field_hidden_targets_help">1 行に 1 つのパスを指定します。</string>
     <string name="field_hidden_package_names">隠すパッケージ名</string>
     <string name="field_hidden_package_names_help">1 行に 1 つのパッケージ名を指定します。</string>
     <string name="field_primary_path_help">Stat、Access、List、Open、Create、Mkdir、Unlink で使用します。</string>

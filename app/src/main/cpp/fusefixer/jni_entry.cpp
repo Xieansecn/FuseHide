@@ -70,6 +70,12 @@ Java_io_github_xiaotong6666_fusefixer_HideConfigNativeBridge_getDefaultHiddenRoo
 }
 
 JNIEXPORT jobjectArray JNICALL
+Java_io_github_xiaotong6666_fusefixer_HideConfigNativeBridge_getDefaultHiddenRelativePaths(
+    JNIEnv* env, jclass) {
+    return VectorToJavaStringArray(env, fusefixer::DefaultHideConfig().hiddenRelativePaths);
+}
+
+JNIEXPORT jobjectArray JNICALL
 Java_io_github_xiaotong6666_fusefixer_HideConfigNativeBridge_getDefaultHiddenPackages(JNIEnv* env,
                                                                                       jclass) {
     return VectorToJavaStringArray(env, fusefixer::DefaultHideConfig().hiddenPackages);
@@ -95,6 +101,12 @@ Java_io_github_xiaotong6666_fusefixer_HideConfigNativeBridge_getCurrentHiddenRoo
 }
 
 JNIEXPORT jobjectArray JNICALL
+Java_io_github_xiaotong6666_fusefixer_HideConfigNativeBridge_getCurrentHiddenRelativePaths(
+    JNIEnv* env, jclass) {
+    return VectorToJavaStringArray(env, fusefixer::CurrentHideConfig()->hiddenRelativePaths);
+}
+
+JNIEXPORT jobjectArray JNICALL
 Java_io_github_xiaotong6666_fusefixer_HideConfigNativeBridge_getCurrentHiddenPackages(JNIEnv* env,
                                                                                       jclass) {
     return VectorToJavaStringArray(env, fusefixer::CurrentHideConfig()->hiddenPackages);
@@ -103,11 +115,12 @@ Java_io_github_xiaotong6666_fusefixer_HideConfigNativeBridge_getCurrentHiddenPac
 JNIEXPORT void JNICALL Java_io_github_xiaotong6666_fusefixer_HideConfigNativeBridge_applyHideConfig(
     JNIEnv* env, jclass, jboolean enableHideAllRootEntries,
     jobjectArray hideAllRootEntriesExemptions, jobjectArray hiddenRootEntryNames,
-    jobjectArray hiddenPackages) {
+    jobjectArray hiddenRelativePaths, jobjectArray hiddenPackages) {
     fusefixer::HideConfig config;
     config.enableHideAllRootEntries = enableHideAllRootEntries == JNI_TRUE;
     config.hideAllRootEntriesExemptions = JStringArrayToVector(env, hideAllRootEntriesExemptions);
     config.hiddenRootEntryNames = JStringArrayToVector(env, hiddenRootEntryNames);
+    config.hiddenRelativePaths = JStringArrayToVector(env, hiddenRelativePaths);
     config.hiddenPackages = JStringArrayToVector(env, hiddenPackages);
     fusefixer::ApplyHideConfig(std::move(config));
 }

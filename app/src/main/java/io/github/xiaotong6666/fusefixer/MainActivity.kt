@@ -130,8 +130,10 @@ class MainActivity : ComponentActivity() {
     private var hideAllRootEntriesExemptionsText by mutableStateOf(
         HideConfigDefaults.toEditorText(HideConfigDefaults.value.hideAllRootEntriesExemptions),
     )
-    private var hiddenRootEntryNamesText by mutableStateOf(
-        HideConfigDefaults.toEditorText(HideConfigDefaults.value.hiddenRootEntryNames),
+    private var hiddenTargetsText by mutableStateOf(
+        HideConfigDefaults.toEditorText(
+            HideConfigDefaults.value.hiddenRootEntryNames + HideConfigDefaults.value.hiddenRelativePaths,
+        ),
     )
     private var hiddenPackagesText by mutableStateOf(
         HideConfigDefaults.toEditorText(HideConfigDefaults.value.hiddenPackages),
@@ -249,7 +251,7 @@ class MainActivity : ComponentActivity() {
                     configResultsScrollToken = configResultsScrollToken,
                     enableHideAllRootEntries = enableHideAllRootEntries,
                     hideAllRootEntriesExemptionsText = hideAllRootEntriesExemptionsText,
-                    hiddenRootEntryNamesText = hiddenRootEntryNamesText,
+                    hiddenTargetsText = hiddenTargetsText,
                     hiddenPackagesText = hiddenPackagesText,
                     pathText = pathText,
                     pathText2 = pathText2,
@@ -257,7 +259,7 @@ class MainActivity : ComponentActivity() {
                     onStatusClick = ::startStatusCheck,
                     onEnableHideAllRootEntriesChanged = { enableHideAllRootEntries = it },
                     onHideAllRootEntriesExemptionsChanged = { hideAllRootEntriesExemptionsText = it },
-                    onHiddenRootEntryNamesChanged = { hiddenRootEntryNamesText = it },
+                    onHiddenTargetsChanged = { hiddenTargetsText = it },
                     onHiddenPackagesChanged = { hiddenPackagesText = it },
                     onSaveConfigClick = ::saveHideConfig,
                     onApplyConfigClick = ::applyHideConfig,
@@ -564,16 +566,34 @@ class MainActivity : ComponentActivity() {
     private fun applyConfigToEditor(config: HideConfig) {
         enableHideAllRootEntries = config.enableHideAllRootEntries
         hideAllRootEntriesExemptionsText = HideConfigDefaults.toEditorText(config.hideAllRootEntriesExemptions)
-        hiddenRootEntryNamesText = HideConfigDefaults.toEditorText(config.hiddenRootEntryNames)
+        hiddenTargetsText = HideConfigDefaults.toEditorText(config.hiddenRootEntryNames + config.hiddenRelativePaths)
         hiddenPackagesText = HideConfigDefaults.toEditorText(config.hiddenPackages)
     }
 
-    private fun currentHideConfig(): HideConfig = HideConfig(
-        enableHideAllRootEntries = enableHideAllRootEntries,
-        hideAllRootEntriesExemptions = HideConfigDefaults.parseEditorText(hideAllRootEntriesExemptionsText),
-        hiddenRootEntryNames = HideConfigDefaults.parseEditorText(hiddenRootEntryNamesText),
-        hiddenPackages = HideConfigDefaults.parseEditorText(hiddenPackagesText),
-    )
+    private fun parseHiddenTargetRules(text: String): Pair<List<String>, List<String>> {
+        val values = HideConfigDefaults.parseEditorText(text)
+        val rootNames = mutableListOf<String>()
+        val relativePaths = mutableListOf<String>()
+        values.forEach { value ->
+            if (value.contains('/')) {
+                relativePaths += value
+            } else {
+                rootNames += value
+            }
+        }
+        return rootNames to relativePaths
+    }
+
+    private fun currentHideConfig(): HideConfig {
+        val (rootNames, relativePaths) = parseHiddenTargetRules(hiddenTargetsText)
+        return HideConfig(
+            enableHideAllRootEntries = enableHideAllRootEntries,
+            hideAllRootEntriesExemptions = HideConfigDefaults.parseEditorText(hideAllRootEntriesExemptionsText),
+            hiddenRootEntryNames = rootNames,
+            hiddenRelativePaths = relativePaths,
+            hiddenPackages = HideConfigDefaults.parseEditorText(hiddenPackagesText),
+        )
+    }
 
     private fun saveHideConfig() {
         HideConfigStore.save(this, currentHideConfig())
@@ -606,6 +626,9 @@ class MainActivity : ComponentActivity() {
         append("hiddenRootEntryNames=\n")
         if (config.hiddenRootEntryNames.isEmpty()) append("(empty)\n")
         config.hiddenRootEntryNames.forEach { append("- $it\n") }
+        append("hiddenRelativePaths=\n")
+        if (config.hiddenRelativePaths.isEmpty()) append("(empty)\n")
+        config.hiddenRelativePaths.forEach { append("- $it\n") }
         append("hiddenPackages=\n")
         if (config.hiddenPackages.isEmpty()) append("(empty)\n")
         config.hiddenPackages.forEach { append("- $it\n") }
@@ -649,11 +672,13 @@ class MainActivity : ComponentActivity() {
             append(", applied=").append(applied.enableHideAllRootEntries).append(")\n\n")
             append(section("hideAllRootEntriesExemptions", draft.hideAllRootEntriesExemptions, applied.hideAllRootEntriesExemptions)).append("\n")
             append(section("hiddenRootEntryNames", draft.hiddenRootEntryNames, applied.hiddenRootEntryNames)).append("\n")
+            append(section("hiddenRelativePaths", draft.hiddenRelativePaths, applied.hiddenRelativePaths)).append("\n")
             append(section("hiddenPackages", draft.hiddenPackages, applied.hiddenPackages))
         }
         val hasDifferences = !boolMatches ||
             draft.hideAllRootEntriesExemptions.toSet() != applied.hideAllRootEntriesExemptions.toSet() ||
             draft.hiddenRootEntryNames.toSet() != applied.hiddenRootEntryNames.toSet() ||
+            draft.hiddenRelativePaths.toSet() != applied.hiddenRelativePaths.toSet() ||
             draft.hiddenPackages.toSet() != applied.hiddenPackages.toSet()
         val summary = if (hasDifferences) {
             getString(R.string.diff_summary_mismatch)
@@ -727,7 +752,7 @@ private fun fuseFixerHomeScreen(
     configResultsScrollToken: Int,
     enableHideAllRootEntries: Boolean,
     hideAllRootEntriesExemptionsText: String,
-    hiddenRootEntryNamesText: String,
+    hiddenTargetsText: String,
     hiddenPackagesText: String,
     pathText: String,
     pathText2: String,
@@ -735,7 +760,7 @@ private fun fuseFixerHomeScreen(
     onStatusClick: () -> Unit,
     onEnableHideAllRootEntriesChanged: (Boolean) -> Unit,
     onHideAllRootEntriesExemptionsChanged: (String) -> Unit,
-    onHiddenRootEntryNamesChanged: (String) -> Unit,
+    onHiddenTargetsChanged: (String) -> Unit,
     onHiddenPackagesChanged: (String) -> Unit,
     onSaveConfigClick: () -> Unit,
     onApplyConfigClick: () -> Unit,
@@ -827,12 +852,12 @@ private fun fuseFixerHomeScreen(
                     configResultsScrollToken = configResultsScrollToken,
                     enableHideAllRootEntries = enableHideAllRootEntries,
                     hideAllRootEntriesExemptionsText = hideAllRootEntriesExemptionsText,
-                    hiddenRootEntryNamesText = hiddenRootEntryNamesText,
+                    hiddenTargetsText = hiddenTargetsText,
                     hiddenPackagesText = hiddenPackagesText,
                     onStatusClick = onStatusClick,
                     onEnableHideAllRootEntriesChanged = onEnableHideAllRootEntriesChanged,
                     onHideAllRootEntriesExemptionsChanged = onHideAllRootEntriesExemptionsChanged,
-                    onHiddenRootEntryNamesChanged = onHiddenRootEntryNamesChanged,
+                    onHiddenTargetsChanged = onHiddenTargetsChanged,
                     onHiddenPackagesChanged = onHiddenPackagesChanged,
                     onSaveConfigClick = onSaveConfigClick,
                     onApplyConfigClick = onApplyConfigClick,
@@ -895,12 +920,12 @@ private fun configScreen(
     configResultsScrollToken: Int,
     enableHideAllRootEntries: Boolean,
     hideAllRootEntriesExemptionsText: String,
-    hiddenRootEntryNamesText: String,
+    hiddenTargetsText: String,
     hiddenPackagesText: String,
     onStatusClick: () -> Unit,
     onEnableHideAllRootEntriesChanged: (Boolean) -> Unit,
     onHideAllRootEntriesExemptionsChanged: (String) -> Unit,
-    onHiddenRootEntryNamesChanged: (String) -> Unit,
+    onHiddenTargetsChanged: (String) -> Unit,
     onHiddenPackagesChanged: (String) -> Unit,
     onSaveConfigClick: () -> Unit,
     onApplyConfigClick: () -> Unit,
@@ -1037,19 +1062,19 @@ private fun configScreen(
             )
             Spacer(Modifier.height(10.dp))
             TextField(
-                value = hiddenRootEntryNamesText,
-                onValueChange = onHiddenRootEntryNamesChanged,
+                value = hiddenTargetsText,
+                onValueChange = onHiddenTargetsChanged,
                 modifier = Modifier.fillMaxWidth(),
-                label = stringResource(R.string.field_hidden_root_names),
+                label = stringResource(R.string.field_hidden_targets),
                 backgroundColor = MiuixTheme.colorScheme.surfaceContainerHighest,
                 labelColor = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                 borderColor = MiuixTheme.colorScheme.primary,
                 textStyle = MiuixTheme.textStyles.main.copy(color = MiuixTheme.colorScheme.onSurface),
-                minLines = 4,
+                minLines = 5,
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                text = stringResource(R.string.field_hidden_root_names_help),
+                text = stringResource(R.string.field_hidden_targets_help),
                 style = MiuixTheme.textStyles.footnote1,
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
             )

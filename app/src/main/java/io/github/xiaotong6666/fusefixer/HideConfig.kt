@@ -4,6 +4,7 @@ data class HideConfig(
     val enableHideAllRootEntries: Boolean,
     val hideAllRootEntriesExemptions: List<String>,
     val hiddenRootEntryNames: List<String>,
+    val hiddenRelativePaths: List<String>,
     val hiddenPackages: List<String>,
 )
 
@@ -14,6 +15,7 @@ object HideConfigDefaults {
             hideAllRootEntriesExemptions =
             HideConfigNativeBridge.getDefaultHideAllRootEntriesExemptions().toList(),
             hiddenRootEntryNames = HideConfigNativeBridge.getDefaultHiddenRootEntryNames().toList(),
+            hiddenRelativePaths = HideConfigNativeBridge.getDefaultHiddenRelativePaths().toList(),
             hiddenPackages = HideConfigNativeBridge.getDefaultHiddenPackages().toList(),
         )
     }

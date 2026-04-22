@@ -68,8 +68,8 @@
     <string name="field_hide_all_desc">Lorsqu’elle est activée, chaque répertoire du premier niveau sous /storage/emulated/0 est masqué, sauf les exceptions visibles ci-dessous.</string>
     <string name="field_visible_exemptions">Exceptions visibles</string>
     <string name="field_visible_exemptions_help">Un chemin par ligne. Laissez Android visible, sauf si vous savez exactement ce que vous faites.</string>
-    <string name="field_hidden_root_names">Cibles masquées</string>
-    <string name="field_hidden_root_names_help">Un chemin par ligne.</string>
+    <string name="field_hidden_targets">Cibles masquées</string>
+    <string name="field_hidden_targets_help">Un chemin par ligne.</string>
     <string name="field_hidden_package_names">Noms de package masqués</string>
     <string name="field_hidden_package_names_help">Un nom de package par ligne.</string>
     <string name="field_primary_path_help">Utilisé par Stat, Access, List, Open, Create, Mkdir et Unlink.</string>

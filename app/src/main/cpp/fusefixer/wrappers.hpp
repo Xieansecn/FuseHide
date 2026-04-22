@@ -5,6 +5,8 @@
 namespace fusefixer {
 
 extern "C" bool WrappedShouldNotCache(void* fuse, const std::string& path);
+void WrappedAddDirectoryEntriesFromLowerFs(DIR* dirp, LowerFsDirentFilterFn filter,
+                                           DirectoryEntries* entries);
 extern "C" void WrappedPfLookup(fuse_req_t req, uint64_t parent, const char* name);
 extern "C" void WrappedPfReaddirPostfilter(fuse_req_t req, uint64_t ino, uint32_t error_in,
                                            off_t off_in, off_t off_out, size_t size_out,
@@ -27,6 +29,8 @@ extern "C" void WrappedPfCreate(fuse_req_t req, uint64_t parent, const char* nam
 extern "C" void WrappedPfReaddir(fuse_req_t req, uint64_t ino, size_t size, off_t off, void* fi);
 extern "C" void WrappedPfReaddirplus(fuse_req_t req, uint64_t ino, size_t size, off_t off,
                                      void* fi);
+extern "C" void WrappedDoReaddirCommon(fuse_req_t req, uint64_t ino, size_t size, off_t off,
+                                       void* fi, bool plus);
 extern "C" int WrappedNotifyInvalEntry(void* se, uint64_t parent, const char* name, size_t namelen);
 extern "C" int WrappedNotifyInvalInode(void* se, uint64_t ino, off_t off, off_t len);
 extern "C" int WrappedReplyEntry(fuse_req_t req, const struct fuse_entry_param* e);
@@ -36,6 +40,8 @@ extern "C" int WrappedReplyErr(fuse_req_t req, int err);
 extern "C" void WrappedPfGetattr(fuse_req_t req, uint64_t ino, void* fi);
 extern "C" int WrappedLstat(const char* path, struct stat* st);
 extern "C" int WrappedStat(const char* path, struct stat* st);
+extern "C" ssize_t WrappedGetxattr(const char* path, const char* name, void* value, size_t size);
+extern "C" ssize_t WrappedLgetxattr(const char* path, const char* name, void* value, size_t size);
 extern "C" int WrappedMkdirLibc(const char* path, mode_t mode);
 extern "C" int WrappedMknod(const char* path, mode_t mode, dev_t dev);
 extern "C" int WrappedOpen(const char* path, int flags, ...);

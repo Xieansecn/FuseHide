@@ -6,6 +6,7 @@ namespace {
 
 thread_local uint32_t gActiveCreateUid = 0;
 thread_local uint32_t gLastPathPolicyUid = 0;
+thread_local std::string gLastPathPolicyPath;
 
 class ScopedCreateUid final {
    public:
@@ -27,6 +28,57 @@ bool ShouldHideLowerFsCreatePath(std::string_view pathView) {
            HiddenPathPolicy::IsExactHiddenTargetPath(pathView);
 }
 
+bool ShouldHideLowerFsPath(std::string_view pathView) {
+    const uint32_t uid = gActiveCreateUid != 0 ? gActiveCreateUid : gLastPathPolicyUid;
+    return uid != 0 && HiddenPathPolicy::ShouldHideTestPath(uid, pathView);
+}
+
+std::string ReadDirectoryPathFromDir(DIR* dirp) {
+    if (dirp == nullptr) {
+        return {};
+    }
+    const int fd = dirfd(dirp);
+    if (fd < 0) {
+        return {};
+    }
+    char procPath[64];
+    std::snprintf(procPath, sizeof(procPath), "/proc/self/fd/%d", fd);
+    char resolved[PATH_MAX];
+    const ssize_t len = readlink(procPath, resolved, sizeof(resolved) - 1);
+    if (len <= 0) {
+        return {};
+    }
+    resolved[len] = '\0';
+    return std::string(resolved, static_cast<size_t>(len));
+}
+
+bool IsFirstComponentOfHiddenRelativePath(std::string_view name) {
+    if (name.empty() || name.find('/') != std::string_view::npos) {
+        return false;
+    }
+    const auto config = CurrentHideConfig();
+    for (const auto& hiddenRelativePath : config->hiddenRelativePaths) {
+        std::string normalized = hiddenRelativePath;
+        while (!normalized.empty() && normalized.front() == '/') {
+            normalized.erase(normalized.begin());
+        }
+        while (!normalized.empty() && normalized.back() == '/') {
+            normalized.pop_back();
+        }
+        if (normalized.empty()) {
+            continue;
+        }
+        const size_t slash = normalized.find('/');
+        const std::string_view first = slash == std::string::npos
+                                           ? std::string_view(normalized)
+                                           : std::string_view(normalized).substr(0, slash);
+        if (first == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 // pf_lookup is the earliest reliable place to learn the real root parent inode on this device.
@@ -43,6 +95,7 @@ extern "C" void WrappedPfLookup(fuse_req_t req, uint64_t parent, const char* nam
     }
     gInPfLookup = true;
     gCurrentLookupParentInode = parent;
+    gCurrentLookupName = name != nullptr ? std::string(name) : std::string();
     gTrackRootHiddenLookup = IsHiddenLookupCacheTarget(parent, name);
     gTrackHiddenSubtreeLookup = IsTrackedHiddenSubtreeInode(parent);
     DebugLogPrint(3, "lookup: req=%lu parent=%s name=%s", (unsigned long)req->unique,
@@ -52,6 +105,7 @@ extern "C" void WrappedPfLookup(fuse_req_t req, uint64_t parent, const char* nam
     if (fn)
         fn(req, parent, name);
     gCurrentLookupParentInode = 0;
+    gCurrentLookupName.clear();
     gInPfLookup = false;
     gTrackHiddenSubtreeLookup = false;
     gTrackRootHiddenLookup = false;
@@ -96,7 +150,51 @@ DirectoryEntries WrappedGetDirectoryEntries(void* wrapper, uint32_t uid, const s
                                             DIR* dirp) {
     auto fn = reinterpret_cast<GetDirectoryEntriesFn>(gOriginalGetDirectoryEntries);
     DirectoryEntries entries = fn ? fn(wrapper, uid, path, dirp) : DirectoryEntries();
+    if (gCurrentReaddirReqUnique != 0) {
+        std::lock_guard<std::mutex> lock(gPendingReaddirContextsMutex);
+        auto it = gPendingReaddirContexts.find(gCurrentReaddirReqUnique);
+        if (it != gPendingReaddirContexts.end()) {
+            it->second.path = path;
+            DebugLogPrint(4, "record readdir path req=%lu ino=%s path=%s",
+                          (unsigned long)gCurrentReaddirReqUnique,
+                          InodePath(it->second.ino).c_str(), DebugPreview(path).c_str());
+        }
+    }
     return FilterHiddenDirectoryEntries(uid, path, std::move(entries));
+}
+
+void WrappedAddDirectoryEntriesFromLowerFs(DIR* dirp, LowerFsDirentFilterFn filter,
+                                           DirectoryEntries* entries) {
+    auto fn =
+        reinterpret_cast<AddDirectoryEntriesFromLowerFsFn>(gOriginalAddDirectoryEntriesFromLowerFs);
+    if (fn == nullptr) {
+        return;
+    }
+    fn(dirp, filter, entries);
+    if (entries == nullptr || entries->empty()) {
+        return;
+    }
+
+    const uint32_t uid = gLastPathPolicyUid;
+    if (!HiddenPathPolicy::IsTestHiddenUid(uid)) {
+        return;
+    }
+
+    std::string parentPath = ReadDirectoryPathFromDir(dirp);
+    if (parentPath.empty()) {
+        parentPath = gLastPathPolicyPath;
+    }
+    if (parentPath.empty()) {
+        return;
+    }
+
+    const size_t before = entries->size();
+    *entries = FilterHiddenDirectoryEntries(uid, parentPath, std::move(*entries));
+    if (entries->size() != before) {
+        DebugLogPrint(4, "filter lower-fs dir entries uid=%u parent=%s removed=%zu remaining=%zu",
+                      static_cast<unsigned>(uid), DebugPreview(parentPath).c_str(),
+                      before - entries->size(), entries->size());
+    }
 }
 
 // AOSP readdir postfilter stats each child path before copying the surviving dirents into a
@@ -121,7 +219,9 @@ extern "C" void WrappedPfReaddirPostfilter(fuse_req_t req, uint64_t ino, uint32_
     gInPfReaddirPostfilter = true;
     gPfReaddirUid = uid;
     gPfReaddirIno = ino;
+    gCurrentReaddirReqUnique = req != nullptr ? req->unique : 0;
     fn(req, ino, error_in, off_in, off_out, size_out, dirents_in, fi);
+    gCurrentReaddirReqUnique = 0;
     gPfReaddirIno = 0;
     gPfReaddirUid = 0;
     gInPfReaddirPostfilter = false;
@@ -337,13 +437,40 @@ extern "C" void WrappedPfReaddir(fuse_req_t req, uint64_t ino, size_t size, off_
     }
     DebugLogPrint(3, "pf_readdir uid=%u ino=%s size=%zu off=%lld", static_cast<unsigned>(uid),
                   InodePath(ino).c_str(), size, static_cast<long long>(off));
+    if (req != nullptr) {
+        std::lock_guard<std::mutex> lock(gPendingReaddirContextsMutex);
+        gPendingReaddirContexts[req->unique] = PendingReaddirContext{uid, ino, {}};
+    }
     gInPfReaddir = true;
     gPfReaddirUid = uid;
     gPfReaddirIno = ino;
+    gCurrentReaddirReqUnique = req != nullptr ? req->unique : 0;
     fn(req, ino, size, off, fi);
+    gCurrentReaddirReqUnique = 0;
     gPfReaddirIno = 0;
     gPfReaddirUid = 0;
     gInPfReaddir = false;
+}
+
+extern "C" void WrappedDoReaddirCommon(fuse_req_t req, uint64_t ino, size_t size, off_t off,
+                                       void* fi, bool plus) {
+    RuntimeState::RememberFuseSession(req);
+    const uint32_t uid = RuntimeState::ReqUid(req);
+    auto fn = reinterpret_cast<void (*)(fuse_req_t, uint64_t, size_t, off_t, void*, bool)>(
+        gOriginalDoReaddirCommon);
+    if (fn == nullptr) {
+        return;
+    }
+    DebugLogPrint(3, "do_readdir_common uid=%u ino=%s size=%zu off=%lld plus=%d",
+                  static_cast<unsigned>(uid), InodePath(ino).c_str(), size,
+                  static_cast<long long>(off), plus ? 1 : 0);
+    if (req != nullptr) {
+        std::lock_guard<std::mutex> lock(gPendingReaddirContextsMutex);
+        gPendingReaddirContexts[req->unique] = PendingReaddirContext{uid, ino, {}};
+    }
+    gCurrentReaddirReqUnique = req != nullptr ? req->unique : 0;
+    fn(req, ino, size, off, fi, plus);
+    gCurrentReaddirReqUnique = 0;
 }
 
 // readdirplus is the common enumeration path on recent Android builds because do_readdir_common()
@@ -362,10 +489,16 @@ extern "C" void WrappedPfReaddirplus(fuse_req_t req, uint64_t ino, size_t size, 
     }
     DebugLogPrint(3, "pf_readdirplus uid=%u ino=%s size=%zu off=%lld", static_cast<unsigned>(uid),
                   InodePath(ino).c_str(), size, static_cast<long long>(off));
+    if (req != nullptr) {
+        std::lock_guard<std::mutex> lock(gPendingReaddirContextsMutex);
+        gPendingReaddirContexts[req->unique] = PendingReaddirContext{uid, ino, {}};
+    }
     gInPfReaddirplus = true;
     gPfReaddirUid = uid;
     gPfReaddirIno = ino;
+    gCurrentReaddirReqUnique = req != nullptr ? req->unique : 0;
     fn(req, ino, size, off, fi);
+    gCurrentReaddirReqUnique = 0;
     gPfReaddirIno = 0;
     gPfReaddirUid = 0;
     gInPfReaddirplus = false;
@@ -405,8 +538,17 @@ extern "C" int WrappedReplyEntry(fuse_req_t req, const struct fuse_entry_param* 
     const bool hiddenLookupForUid = HiddenPathPolicy::IsTestHiddenUid(RuntimeState::ReqUid(req)) &&
                                     (gTrackRootHiddenLookup || gTrackHiddenSubtreeLookup);
     if (hiddenLookupForUid) {
-        if (gTrackRootHiddenLookup) {
+        if (gTrackRootHiddenLookup || gTrackHiddenSubtreeLookup) {
             ArmHiddenCreateLeakRemap(req, "fuse_reply_entry");
+        }
+        if (gTrackHiddenSubtreeLookup) {
+            if (const auto parentPath = LookupTrackedPathForInode(gCurrentLookupParentInode);
+                parentPath.has_value()) {
+                RememberRecentHiddenParentPath(RuntimeState::ReqUid(req), *parentPath);
+                DebugLogPrint(4, "refresh recent hidden parent from hidden lookup uid=%u path=%s",
+                              static_cast<unsigned>(RuntimeState::ReqUid(req)),
+                              DebugPreview(*parentPath).c_str());
+            }
         }
         if (auto ret = ReplyErrorBridge::Reply(req, ENOENT, "fuse_reply_entry"); ret.has_value()) {
             DebugLogPrint(4, "hide lookup entry uid=%u req=%lu ino=%s root=%d child=%d ret=%d",
@@ -415,6 +557,13 @@ extern "C" int WrappedReplyEntry(fuse_req_t req, const struct fuse_entry_param* 
                           e != nullptr ? InodePath(e->ino).c_str() : "(null)",
                           gTrackRootHiddenLookup ? 1 : 0, gTrackHiddenSubtreeLookup ? 1 : 0, *ret);
             RuntimeState::ScheduleHiddenEntryInvalidation();
+            if (gCurrentLookupParentInode != 0 && !gCurrentLookupName.empty()) {
+                RuntimeState::ScheduleSpecificEntryInvalidation(gCurrentLookupParentInode,
+                                                                gCurrentLookupName);
+            }
+            if (e != nullptr && e->ino != 0) {
+                RuntimeState::ScheduleHiddenInodeInvalidation(e->ino);
+            }
             return *ret;
         }
     }
@@ -431,6 +580,41 @@ extern "C" int WrappedReplyEntry(fuse_req_t req, const struct fuse_entry_param* 
         RuntimeState::ScheduleHiddenEntryInvalidation();
         if (TrackHiddenSubtreeInode(e->ino)) {
             RuntimeState::ScheduleHiddenInodeInvalidation(e->ino);
+        }
+    }
+    // The device build sometimes delivers directory data through reply_buf without ever hitting our
+    // readdir-family wrappers, but lookup success for the visible parent still flows through
+    // fuse_reply_entry. Record the parent path here so reply_buf can later reconstruct an exact
+    // parentPath + childName match for nested hidden targets.
+    // AOSP references: jni/FuseDaemon.cpp#889, #912, and #1909
+    // https://android.googlesource.com/platform/packages/providers/MediaProvider/+/refs/heads/android14-release/jni/FuseDaemon.cpp#889
+    // https://android.googlesource.com/platform/packages/providers/MediaProvider/+/refs/heads/android14-release/jni/FuseDaemon.cpp#912
+    // https://android.googlesource.com/platform/packages/providers/MediaProvider/+/refs/heads/android14-release/jni/FuseDaemon.cpp#1909
+    if (e != nullptr && gCurrentLookupParentInode != 0 && !gCurrentLookupName.empty()) {
+        std::optional<std::string> childPath;
+        if (const auto parentPath = LookupTrackedPathForInode(gCurrentLookupParentInode);
+            parentPath.has_value()) {
+            childPath = HiddenPathPolicy::JoinPathComponent(*parentPath, gCurrentLookupName);
+        } else if (IsFirstComponentOfHiddenRelativePath(gCurrentLookupName)) {
+            childPath =
+                HiddenPathPolicy::JoinPathComponent(kVisibleStorageRoots[0], gCurrentLookupName);
+            DebugLogPrint(4, "infer root child path ino=%s name=%s path=%s",
+                          InodePath(gCurrentLookupParentInode).c_str(),
+                          DebugPreview(gCurrentLookupName).c_str(),
+                          DebugPreview(*childPath).c_str());
+        }
+        if (childPath.has_value()) {
+            RememberTrackedPathForInode(e->ino, *childPath);
+            if (HiddenPathPolicy::IsAnyHiddenSubtreePath(*childPath)) {
+                TrackHiddenSubtreeInode(e->ino);
+            }
+            if (HiddenPathPolicy::IsTestHiddenUid(RuntimeState::ReqUid(req)) &&
+                IsParentOfExactHiddenTargetPath(*childPath)) {
+                RememberRecentHiddenParentPath(RuntimeState::ReqUid(req), *childPath);
+                DebugLogPrint(4, "remember recent hidden parent uid=%u path=%s",
+                              static_cast<unsigned>(RuntimeState::ReqUid(req)),
+                              DebugPreview(*childPath).c_str());
+            }
         }
     }
     int ret = fn ? fn(req, replyEntry) : -1;
@@ -472,14 +656,46 @@ extern "C" int WrappedReplyBuf(fuse_req_t req, const char* buf, size_t size) {
     size_t replySize = size;
     std::vector<char> filteredStorage;
     size_t removedCount = 0;
+    PendingReaddirContext pendingContext{};
+    bool hasPendingContext = false;
+    if (req != nullptr) {
+        std::lock_guard<std::mutex> lock(gPendingReaddirContextsMutex);
+        const auto it = gPendingReaddirContexts.find(req->unique);
+        if (it != gPendingReaddirContexts.end()) {
+            pendingContext = it->second;
+            hasPendingContext = true;
+        }
+    }
     const uint32_t reqUid = RuntimeState::ReqUid(req);
-    const uint32_t filterUid = gPfReaddirUid != 0 ? gPfReaddirUid : reqUid;
-    const uint64_t filterIno = gPfReaddirIno != 0 ? gPfReaddirIno : 0;
+    const uint32_t filterUid =
+        gPfReaddirUid != 0
+            ? gPfReaddirUid
+            : (hasPendingContext && pendingContext.uid != 0 ? pendingContext.uid : reqUid);
+    const uint64_t filterIno =
+        gPfReaddirIno != 0 ? gPfReaddirIno : (hasPendingContext ? pendingContext.ino : 0);
     const bool filterPlainReaddir = gInPfReaddir;
     const bool filterPostfilterReaddir = gInPfReaddirPostfilter;
     const bool filterReaddirplus = gInPfReaddirplus;
     const bool requireParentMatch = filterIno != 0;
     const char* filterMode = nullptr;
+    const std::optional<std::string> fallbackParentPath =
+        filterIno == 0 ? LookupRecentHiddenParentPath(filterUid) : std::nullopt;
+
+    if (filterIno != 0 && !pendingContext.path.empty()) {
+        RememberTrackedPathForInode(filterIno, pendingContext.path);
+    }
+
+    if (HiddenPathPolicy::IsTestHiddenUid(filterUid)) {
+        DebugLogPrint(
+            4,
+            "reply_buf filter ctx req=%lu uid=%u ino=%s pending=%d pending_path=%s "
+            "fallback_parent=%s mode_flags=%d/%d/%d",
+            req ? (unsigned long)req->unique : 0UL, static_cast<unsigned>(filterUid),
+            InodePath(filterIno).c_str(), hasPendingContext ? 1 : 0,
+            pendingContext.path.empty() ? "" : DebugPreview(pendingContext.path).c_str(),
+            fallbackParentPath.has_value() ? DebugPreview(*fallbackParentPath).c_str() : "",
+            filterPlainReaddir ? 1 : 0, filterReaddirplus ? 1 : 0, filterPostfilterReaddir ? 1 : 0);
+    }
 
     if (HiddenPathPolicy::IsTestHiddenUid(filterUid)) {
         if (filterPlainReaddir) {
@@ -518,6 +734,48 @@ extern "C" int WrappedReplyBuf(fuse_req_t req, const char* buf, size_t size) {
             }
         }
 
+        // When the active device path bypasses our readdir wrappers, reply_buf still sees the final
+        // dirent payload but loses the parent inode/path context. Fall back to the last visible
+        // parent path learned from fuse_reply_entry so nested targets like Download/Download can be
+        // filtered by exact path instead of by name alone.
+        if (filterMode == nullptr) {
+            if (fallbackParentPath.has_value() &&
+                BuildFilteredDirentplusPayloadForParentPath(
+                    buf, size, filterUid, *fallbackParentPath, &filteredStorage, &removedCount)) {
+                replyBuf = filteredStorage.data();
+                replySize = filteredStorage.size();
+                filterMode = "fallback_parent_direntplus";
+                ClearRecentHiddenParentPath(filterUid);
+            } else if (fallbackParentPath.has_value() &&
+                       BuildFilteredDirentPayloadForParentPath(buf, size, filterUid,
+                                                               *fallbackParentPath,
+                                                               &filteredStorage, &removedCount)) {
+                replyBuf = filteredStorage.data();
+                replySize = filteredStorage.size();
+                filterMode = "fallback_parent_dirent";
+                ClearRecentHiddenParentPath(filterUid);
+            } else if (size >= sizeof(fuse_read_out) && fallbackParentPath.has_value()) {
+                const auto* readOut = reinterpret_cast<const fuse_read_out*>(buf);
+                const size_t payloadSize =
+                    std::min<size_t>(readOut->size, size - sizeof(fuse_read_out));
+                std::vector<char> filteredPayload;
+                if (BuildFilteredDirentPayloadForParentPath(
+                        buf + sizeof(fuse_read_out), payloadSize, filterUid, *fallbackParentPath,
+                        &filteredPayload, &removedCount)) {
+                    fuse_read_out patched = *readOut;
+                    patched.size = static_cast<uint32_t>(filteredPayload.size());
+                    filteredStorage.resize(sizeof(patched) + filteredPayload.size());
+                    std::memcpy(filteredStorage.data(), &patched, sizeof(patched));
+                    std::memcpy(filteredStorage.data() + sizeof(patched), filteredPayload.data(),
+                                filteredPayload.size());
+                    replyBuf = filteredStorage.data();
+                    replySize = filteredStorage.size();
+                    filterMode = "fallback_parent_read_out_dirent";
+                    ClearRecentHiddenParentPath(filterUid);
+                }
+            }
+        }
+
         if (filterMode == nullptr) {
             if (DirentFilter::BuildFilteredDirentplusPayload(
                     buf, size, filterUid, 0, &filteredStorage, &removedCount, false)) {
@@ -552,6 +810,10 @@ extern "C" int WrappedReplyBuf(fuse_req_t req, const char* buf, size_t size) {
     }
 
     int ret = fn ? fn(req, replyBuf, replySize) : -1;
+    if (hasPendingContext && req != nullptr) {
+        std::lock_guard<std::mutex> lock(gPendingReaddirContextsMutex);
+        gPendingReaddirContexts.erase(req->unique);
+    }
     if (removedCount != 0) {
         DebugLogPrint(4, "filtered readdir reply mode=%s uid=%u ino=%s removed=%zu size=%zu->%zu",
                       filterMode ? filterMode : "unknown", static_cast<unsigned>(filterUid),
@@ -568,6 +830,10 @@ extern "C" int WrappedReplyBuf(fuse_req_t req, const char* buf, size_t size) {
 
 extern "C" int WrappedReplyErr(fuse_req_t req, int err) {
     auto fn = ReplyErrorBridge::Original();
+    if (req != nullptr) {
+        std::lock_guard<std::mutex> lock(gPendingReaddirContextsMutex);
+        gPendingReaddirContexts.erase(req->unique);
+    }
     err = MaybeRewriteHiddenLeakErrno(req, err, "fuse_reply_err");
     int ret = fn ? fn(req, err) : -1;
     if (gInPfLookupPostfilter) {
@@ -635,7 +901,14 @@ extern "C" int WrappedLstat(const char* path, struct stat* st) {
     }
     auto fn = reinterpret_cast<int (*)(const char*, struct stat*)>(gOriginalLstat);
     if (fn) {
-        return fn(path, st);
+        const int ret = fn(path, st);
+        if (ret == 0 && gInPfGetattr && gPfGetattrIno != 0) {
+            RememberTrackedPathForInode(gPfGetattrIno, pathView);
+            if (HiddenPathPolicy::IsAnyHiddenSubtreePath(pathView)) {
+                TrackHiddenSubtreeInode(gPfGetattrIno);
+            }
+        }
+        return ret;
     }
     errno = ENOSYS;
     return -1;
@@ -653,6 +926,40 @@ extern "C" int WrappedStat(const char* path, struct stat* st) {
     auto fn = reinterpret_cast<int (*)(const char*, struct stat*)>(gOriginalStat);
     if (fn) {
         return fn(path, st);
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" ssize_t WrappedGetxattr(const char* path, const char* name, void* value, size_t size) {
+    const std::string_view pathView = path != nullptr ? std::string_view(path) : std::string_view();
+    if (ShouldHideLowerFsPath(pathView)) {
+        DebugLogPrint(4, "hide getxattr path=%s name=%s", DebugPreview(pathView).c_str(),
+                      name != nullptr ? DebugPreview(name).c_str() : "null");
+        errno = ENOENT;
+        return -1;
+    }
+    auto fn =
+        reinterpret_cast<ssize_t (*)(const char*, const char*, void*, size_t)>(gOriginalGetxattr);
+    if (fn) {
+        return fn(path, name, value, size);
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" ssize_t WrappedLgetxattr(const char* path, const char* name, void* value, size_t size) {
+    const std::string_view pathView = path != nullptr ? std::string_view(path) : std::string_view();
+    if (ShouldHideLowerFsPath(pathView)) {
+        DebugLogPrint(4, "hide lgetxattr path=%s name=%s", DebugPreview(pathView).c_str(),
+                      name != nullptr ? DebugPreview(name).c_str() : "null");
+        errno = ENOENT;
+        return -1;
+    }
+    auto fn =
+        reinterpret_cast<ssize_t (*)(const char*, const char*, void*, size_t)>(gOriginalLgetxattr);
+    if (fn) {
+        return fn(path, name, value, size);
     }
     errno = ENOSYS;
     return -1;
@@ -794,6 +1101,7 @@ bool WrappedIsAppAccessiblePath(void* fuse, const std::string& path, uint32_t ui
         return false;
     }
     gLastPathPolicyUid = uid;
+    gLastPathPolicyPath = path;
     if (!UnicodePolicy::NeedsSanitization(path)) {
         UnicodePolicy::LogSuspiciousDirectPath("app_accessible", path);
         if (ShouldLogLimited(gAppAccessibleLogCount)) {
@@ -810,6 +1118,7 @@ bool WrappedIsAppAccessiblePath(void* fuse, const std::string& path, uint32_t ui
     }
     std::string sanitized(path);
     UnicodePolicy::RewriteString(sanitized);
+    gLastPathPolicyPath = sanitized;
     if (ShouldLogLimited(gAppAccessibleLogCount)) {
         DebugLogPrint(3, "app_accessible rewrite uid=%u old=%s new=%s", uid,
                       DebugPreview(path).c_str(), DebugPreview(sanitized).c_str());
