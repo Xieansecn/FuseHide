@@ -53,8 +53,12 @@ android {
     }
 
     signingConfigs {
-        val keystoreFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
-        if (keystoreFile.exists()) {
+        val keystoreFile = if (System.getProperty("os.name").startsWith("Windows", ignoreCase = true)) {
+            file("C:/Users/${System.getProperty("user.name")}/.android/debug.keystore")
+        } else {
+            file(System.getProperty("user.home") + "/.android/debug.keystore")
+        }
+        if (keystoreFile.isFile && keystoreFile.canRead()) {
             register("debugKey") {
                 storeFile = keystoreFile
                 storePassword = "android"
