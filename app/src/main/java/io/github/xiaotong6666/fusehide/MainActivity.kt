@@ -989,7 +989,7 @@ private fun configScreen(
         sectionCard {
             Text(
                 stringResource(R.string.section_runtime_policy),
-                style = MiuixTheme.textStyles.title3.copy(fontWeight = FontWeight.Medium),
+                style = MiuixTheme.textStyles.body1,
                 color = MiuixTheme.colorScheme.onSurface,
             )
             Spacer(Modifier.height(6.dp))
